@@ -6,6 +6,7 @@ import time
 import json
 import urllib.request
 import urllib.error
+import re
 from faster_whisper import WhisperModel
 
 os.environ["HF_HUB_CACHE"] = "/var/bigbluebutton/hf_cache"
@@ -62,6 +63,7 @@ def get_best_active_cf_model(account_id: str, api_token: str) -> str:
 def generate_summary(transcript_text: str) -> str:
     """
     Generates meeting summary by dynamically picking an active model from Cloudflare.
+    Strips out conversational intros/preambles for a clean final output.
     """
     account_id = os.environ.get("CF_ACCOUNT_ID")
     api_token = os.environ.get("CF_API_TOKEN")
@@ -69,19 +71,25 @@ def generate_summary(transcript_text: str) -> str:
     if not account_id or not api_token:
         return "[Error: CF_ACCOUNT_ID or CF_API_TOKEN environment variables not set]"
 
-    # 1. Dynamically query Cloudflare for an active model
     model = get_best_active_cf_model(account_id, api_token)
-
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
-    system_prompt = "You are an AI executive assistant. Summarize meeting transcripts accurately and concisely."
+    # Explicitly instruct the model to skip introductory/conversational remarks
+    system_prompt = (
+        "You are an executive assistant. Your task is to provide a clean meeting summary. "
+        "Do NOT include conversational intros, headers like 'Here is a summary', or meta-commentary. "
+        "Begin immediately with the Executive Summary."
+    )
+
     user_prompt = (
         "Summarize the following meeting transcript.\n\n"
         "Formatting guidelines:\n"
-        "1. Executive Summary (2-3 sentences)\n"
-        "2. Key Discussion Points (bullet points)\n"
-        "3. Decisions Made\n"
-        "4. Action Items & Next Steps\n\n"
+        "## Executive Summary\n"
+        "(2-3 concise sentences)\n\n"
+        "## Key Discussion Points\n"
+        "(bullet points)\n\n"
+        "## Decisions Made\n\n"
+        "## Action Items & Next Steps\n\n"
         f"TRANSCRIPT:\n{transcript_text}"
     )
 
@@ -105,7 +113,17 @@ def generate_summary(transcript_text: str) -> str:
         with urllib.request.urlopen(req, timeout=45) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             if res_data.get("success"):
-                return res_data.get("result", {}).get("response", "Error: Empty response.")
+                raw_summary = res_data.get("result", {}).get("response", "")
+                
+                # Regex fallback: strips common intro phrases if the model ignores the prompt instruction
+                cleaned_summary = re.sub(
+                    r"^(here is (a|the) summary[^\n]*\n?|sure[^\n]*\n?|certainly[^\n]*\n?)", 
+                    "", 
+                    raw_summary, 
+                    flags=re.IGNORECASE
+                ).strip()
+
+                return cleaned_summary
             else:
                 errors = res_data.get("errors", [])
                 return f"[Cloudflare API Error: {errors}]"
@@ -115,7 +133,7 @@ def generate_summary(transcript_text: str) -> str:
         return f"[HTTP Error {e.code}: {error_body}]"
     except Exception as e:
         return f"[Error generating summary: {e}]"
-
+        
 def process_recording(meeting_id):
     publish_dir = f"/var/bigbluebutton/published/presentation/{meeting_id}"
     
