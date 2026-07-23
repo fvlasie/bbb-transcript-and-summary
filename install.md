@@ -21,3 +21,8 @@ sudo chown -R bigbluebutton:bigbluebutton /opt/speech_env /var/bigbluebutton/hf_
 # Copy file to /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py 
 sudo chmod +x /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py
 sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py
+
+# Create sh script
+nano /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
+sudo chmod +x /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
+sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
