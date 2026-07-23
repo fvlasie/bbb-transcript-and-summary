@@ -17,3 +17,7 @@ sudo mkdir -p /var/bigbluebutton/hf_cache
 
 # Transfer ownership to the bigbluebutton user
 sudo chown -R bigbluebutton:bigbluebutton /opt/speech_env /var/bigbluebutton/hf_cache
+
+# Copy file to /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py 
+sudo chmod +x /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py
+sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py
