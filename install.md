@@ -26,3 +26,10 @@ sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/tra
 nano /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
 sudo chmod +x /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
 sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh
+
+# Give BBB user ownership of its own home cache
+sudo chown -R bigbluebutton:bigbluebutton /home/bigbluebutton/.cache
+
+# Re-verify the large cache folder is owned by BBB
+sudo mkdir -p /home/bigbluebutton/.cache
+sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/hf_cache
