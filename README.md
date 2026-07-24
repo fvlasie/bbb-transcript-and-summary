@@ -28,7 +28,7 @@ Artifacts are delivered directly via the default BBB presentation playback layer
 ---
 
 ## 🔄 Workflow Overview
-
+```
 [BBB Recording Ends]
 │
 ▼
@@ -42,7 +42,7 @@ Artifacts are delivered directly via the default BBB presentation playback layer
 │
 ▼
 [Published Artifacts] Available natively at https://bbb.yourdomain.com/presentation/...
-
+```
 ---
 
 ## 🚀 Quick Setup & Installation
