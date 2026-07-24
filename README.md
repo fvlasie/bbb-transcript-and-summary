@@ -28,21 +28,21 @@ Artifacts are delivered directly via the default BBB presentation playback layer
 ---
 
 ## 🔄 Workflow Overview
-```
-[BBB Recording Ends]
-│
-▼
-[01_transcribe_whisper.sh] ──► Runs Python Venv pipeline
-│
-├── 1. Parse timeline from events.xml (Speaker attribution)
-├── 2. Transcribe WebM using faster-whisper (large-v3-turbo)
-├── 3. Output WebVTT & Speaker TXT -> /presentation//transcript/
-├── 4. Summarize via Cloudflare Workers AI -> HTML & RTF
-└── 5. Register native playback URLs in metadata.xml
-│
-▼
-[Published Artifacts] Available natively at https://bbb.yourdomain.com/presentation/...
-```
+`
+`[BBB Recording Ends]
+`│
+`▼
+`[01_transcribe_whisper.sh] ──► Runs Python Venv pipeline
+`│
+`├── 1. Parse timeline from events.xml (Speaker attribution)
+`├── 2. Transcribe WebM using faster-whisper (large-v3-turbo)
+`├── 3. Output WebVTT & Speaker TXT -> /presentation//transcript/
+`├── 4. Summarize via Cloudflare Workers AI -> HTML & RTF
+`└── 5. Register native playback URLs in metadata.xml
+`│
+`▼
+`[Published Artifacts] Available natively at https://bbb.yourdomain.com/presentation/...
+
 ---
 
 ## 🚀 Quick Setup & Installation
