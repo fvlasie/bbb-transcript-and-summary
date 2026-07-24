@@ -1,5 +1,5 @@
 # 1. Ensure system audio tools & FFmpeg are present
-sudo apt update && sudo apt install -y python3.10-venv python3-pip ffmpeg portaudio19-dev markdown
+sudo apt update && sudo apt install -y python3.10-venv python3-pip ffmpeg portaudio19-dev 
 
 # 2. Create and activate a dedicated virtual environment
 python3 -m venv speech_env
@@ -7,7 +7,7 @@ source speech_env/bin/activate
 
 # 3. Upgrade pip and install faster-whisper + audio tools
 pip install --upgrade pip
-pip install faster-whisper sounddevice numpy
+pip install faster-whisper sounddevice numpy markdown
 
 # Move virtual environment out of /root
 sudo mv /root/speech_env /opt/speech_env
