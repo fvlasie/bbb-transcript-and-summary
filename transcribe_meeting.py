@@ -6,14 +6,13 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from faster_whisper import WhisperModel
 
-import xml.etree.ElementTree as ET
-
 def parse_bbb_speaker_timeline(events_xml_path: str):
     """
-    Parses BBB 3.x events.xml to map speaker names to audio timestamps (0.0s relative to audio.webm).
+    Parses BBB 3.x events.xml to map speaker names to audio timestamps 
+    relative to StartRecordingEvent (t0 for audio.webm).
     """
     if not os.path.exists(events_xml_path):
-        print(f"[Speaker Map] Warning: {events_xml_path} not found.")
+        print(f"[Speaker Map] Warning: XML not found at {events_xml_path}. Skipping speaker attribution.")
         return []
 
     try:
@@ -24,7 +23,6 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
         return []
 
     # 1. Map participant IDs to Display Names
-    # Check PARTICIPANT module join events
     participants = {}
     for event in root.findall(".//event[@module='PARTICIPANT'][@eventname='ParticipantJoinEvent']"):
         u_id = event.findtext("userId")
@@ -32,23 +30,22 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
         if u_id and name:
             participants[u_id] = name
 
-    # Check VOICE module join events (sometimes callernumber or participant is used)
     for event in root.findall(".//event[@module='VOICE'][@eventname='ParticipantJoinedEvent']"):
         p_id = event.findtext("participant")
         caller_name = event.findtext("callername")
         if p_id and caller_name:
             participants[p_id] = caller_name
 
-    # 2. Find the exact StartRecordingEvent timestamp (t0 for audio.webm)
+    # 2. Find StartRecordingEvent timestampUTC (t0)
     start_rec_event = root.find(".//event[@module='VOICE'][@eventname='StartRecordingEvent']")
     if start_rec_event is None or start_rec_event.find("timestampUTC") is None:
-        print("[Speaker Map] Error: Could not find StartRecordingEvent timestampUTC.")
+        print("[Speaker Map] Warning: StartRecordingEvent missing in XML. Skipping speaker attribution.")
         return []
 
     t0_ms = float(start_rec_event.findtext("timestampUTC"))
 
-    # 3. Track talking state and build intervals
-    active_talkers = {} # participant_id -> start_sec
+    # 3. Extract talking intervals
+    active_talkers = {}
     timeline = []
 
     for event in root.findall(".//event[@module='VOICE'][@eventname='ParticipantTalkingEvent']"):
@@ -60,7 +57,6 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
             continue
 
         ts_ms = float(ts_utc_node.text)
-        # Calculate seconds from start of audio.webm
         rel_sec = max(0.0, (ts_ms - t0_ms) / 1000.0)
 
         if is_talking:
@@ -75,40 +71,35 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
                     "name": speaker_name
                 })
 
-    # Close any talkers who were still talking when recording ended
+    # Flush active talkers if recording cut off mid-speech
     for p_id, start_sec in active_talkers.items():
         speaker_name = participants.get(p_id, "Unknown Speaker")
-        timeline.append({
-            "start": start_sec,
-            "end": start_sec + 5.0, # Default padding
-            "name": speaker_name
-        })
+        timeline.append({"start": start_sec, "end": start_sec + 5.0, "name": speaker_name})
 
-    print(f"[Speaker Map] Successfully mapped {len(timeline)} voice intervals for {len(participants)} participants.")
+    print(f"[Speaker Map] Successfully mapped {len(timeline)} talking segments from XML.")
     return timeline
 
+
 def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) -> str:
-    """
-    Finds the speaker active during [start_sec, end_sec] with fuzzy tolerance.
-    """
+    """Finds speaker active during [start_sec, end_sec] with fuzzy buffer."""
     if not timeline:
         return ""
 
     midpoint = (start_sec + end_sec) / 2.0
-    
-    # 1. Direct overlap check
     for interval in timeline:
         if interval["start"] <= midpoint <= interval["end"]:
             return interval["name"]
 
-    # 2. Fuzzy match within a 1.5-second buffer (handles slight VAD drift)
+    # Fuzzy buffer for minor VAD alignment drift
     for interval in timeline:
         if not (end_sec + 1.5 < interval["start"] or start_sec - 1.5 > interval["end"]):
             return interval["name"]
 
     return ""
 
+
 def get_best_active_cf_model(account_id: str, api_token: str) -> str:
+    """Queries Cloudflare Workers AI model catalog dynamically."""
     catalog_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?task=Text%20Generation"
     try:
         req = urllib.request.Request(catalog_url, headers={"Authorization": f"Bearer {api_token}"})
@@ -125,11 +116,11 @@ def get_best_active_cf_model(account_id: str, api_token: str) -> str:
                     for preferred in priority_order:
                         for m in valid_models:
                             if preferred in m:
-                                print(f"[Catalog] Selected model: {m}")
+                                print(f"[Catalog] Selected Cloudflare model: {m}")
                                 return m
                     return valid_models[0]
     except Exception as e:
-        print(f"[Warning] Catalog query failed ({e}). Using default fallback.")
+        print(f"[Warning] Catalog query failed ({e}). Falling back to default model.")
 
     return "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 
@@ -157,8 +148,8 @@ def generate_summary(transcript_text: str) -> str:
     system_prompt = (
         "You are an executive assistant. Your task is to provide a clean, accurate meeting summary based on speaker-attributed transcripts. "
         "CRITICAL INSTRUCTIONS:\n"
-        "1. Do NOT include conversational intros or preambles (e.g., 'Here is a summary'). Start directly with '## Executive Summary'.\n"
-        "2. Do NOT inflate brief off-hand remarks, mic checks, or automated prompts into major discussion points.\n"
+        "1. Do NOT include conversational intros or preambles. Start directly with '## Executive Summary'.\n"
+        "2. Do NOT inflate brief off-hand remarks or automated prompts into major discussion points.\n"
         "3. Attribute key points or action items to specific speakers if mentioned in the transcript.\n"
         "4. If a section has no meaningful content, explicitly write 'None'."
     )
@@ -185,10 +176,7 @@ def generate_summary(transcript_text: str) -> str:
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_token}",
-                "Content-Type": "application/json"
-            }
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=45) as response:
             res_data = json.loads(response.read().decode("utf-8"))
@@ -217,26 +205,34 @@ def main():
     output_dir = sys.argv[2]
     events_xml_path = sys.argv[3] if len(sys.argv) > 3 else ""
 
+    # 1. Extract speaker timeline from events.xml
+    timeline = parse_bbb_speaker_timeline(events_xml_path) if events_xml_path else []
+
+    # 2. Run Whisper transcription
     print(f"[Whisper] Loading model 'medium'...")
     model = WhisperModel("medium", device="cpu", compute_type="int8", download_root="/var/bigbluebutton/hf_cache")
 
     print(f"[Whisper] Transcribing {audio_path}...")
     segments, _ = model.transcribe(audio_path, vad_filter=True, language="en")
 
-    # Parse speaker timeline from events.xml
-    timeline = parse_bbb_speaker_timeline(events_xml_path) if events_xml_path else []
-
     full_transcript = []
     vtt_lines = ["WEBVTT\n"]
 
+    # 3. Format WebVTT and Text with Speaker Tagging inline
     for segment in segments:
         speaker = get_speaker_for_timestamp(segment.start, segment.end, timeline)
         speaker_prefix = f"[{speaker}]: " if speaker else ""
         
-        text_line = f"{speaker_prefix}{segment.text.strip()}"
+        raw_text = segment.text.strip()
+        
+        # Filter out automated BBB voice prompt
+        if "you are currently the only person" in raw_text.lower():
+            continue
+
+        text_line = f"{speaker_prefix}{raw_text}"
         full_transcript.append(text_line)
 
-        # Format WebVTT timestamps (HH:MM:SS.mmm)
+        # WebVTT formatting (HH:MM:SS.mmm)
         start_fmt = f"{int(segment.start//3600):02d}:{int((segment.start%3600)//60):02d}:{segment.start%60:06.3f}"
         end_fmt = f"{int(segment.end//3600):02d}:{int((segment.end%3600)//60):02d}:{segment.end%60:06.3f}"
         
@@ -244,19 +240,20 @@ def main():
 
     full_text = "\n".join(full_transcript)
 
-    # Save transcript files
+    # 4. Save output files
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "transcript.txt"), "w") as f:
-        f.write(full_text)
+        f.write(full_text + "\n")
 
     with open(os.path.join(output_dir, "transcript.vtt"), "w") as f:
-        f.write("\n".join(vtt_lines))
+        f.write("\n".join(vtt_lines) + "\n")
 
+    # 5. Summarize via Cloudflare Workers AI
     print("[Summary] Generating AI meeting summary...")
     summary = generate_summary(full_text)
 
     with open(os.path.join(output_dir, "transcript_summary.txt"), "w") as f:
-        f.write(summary)
+        f.write(summary + "\n")
 
     print("[Complete] Processing finished successfully.")
 
