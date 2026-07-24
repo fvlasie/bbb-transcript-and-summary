@@ -30,6 +30,15 @@ sudo chown bigbluebutton:bigbluebutton /usr/local/bigbluebutton/core/scripts/pos
 # Give BBB user ownership of its own home cache
 sudo chown -R bigbluebutton:bigbluebutton /home/bigbluebutton/.cache
 
+# Create new format directories
+sudo mkdir -p /var/bigbluebutton/published/summary
+sudo mkdir -p /var/bigbluebutton/published/transcript
+
+sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/published/summary
+sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/published/transcript
+
+sudo chmod -R 775 /var/bigbluebutton/published/summary
+sudo chmod -R 775 /var/bigbluebutton/published/transcript
 # Re-verify the large cache folder is owned by BBB
 sudo mkdir -p /home/bigbluebutton/.cache
 sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/hf_cache
