@@ -27,7 +27,7 @@ echo "[$(date)] Starting published WebM transcription for ${MEETING_ID}..." >> "
 
 if [ -n "$WEBM_FILE" ] && [ -f "$WEBM_FILE" ]; then
     nice -n 15 ionice -c 3 /opt/speech_env/bin/python3 \
-        /usr/local/bigbluebutton/core/scripts/post_publish/transcribe_meeting.py \
+        /usr/local/bigbluebutton/core/scripts/post_publish/lib/transcribe_meeting.py \
         "$WEBM_FILE" \
         "$PUBLISHED_DIR" \
         "$EVENTS_XML" >> "$LOG_FILE" 2>&1
