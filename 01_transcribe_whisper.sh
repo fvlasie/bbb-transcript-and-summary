@@ -19,7 +19,7 @@ AUDIO_FILE="${RAW_DIR}/audio/audio.webm"
 EVENTS_XML="${RAW_DIR}/events.xml"
 
 if [ -f "$AUDIO_FILE" ]; then
-    python3 /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py \
+    nice -n 15 ionice -c 3 /opt/speech_env/bin/python3 /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py \
         "$AUDIO_FILE" \
         "$PUBLISHED_DIR" \
         "$EVENTS_XML" >> "$LOG_FILE" 2>&1
