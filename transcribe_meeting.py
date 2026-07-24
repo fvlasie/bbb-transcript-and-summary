@@ -10,8 +10,7 @@ import xml.etree.ElementTree as ET
 
 def parse_bbb_speaker_timeline(events_xml_path: str):
     """
-    Parses BBB events.xml and normalizes relative millisecond timestamps
-    to align cleanly with Whisper's 00:00:00 start.
+    Parses BBB 3.x events.xml to map speaker names to audio timestamps (0.0s relative to audio.webm).
     """
     if not os.path.exists(events_xml_path):
         print(f"[Speaker Map] Warning: {events_xml_path} not found.")
@@ -24,58 +23,69 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
         print(f"[Speaker Map] Error parsing XML: {e}")
         return []
 
+    # 1. Map participant IDs to Display Names
+    # Check PARTICIPANT module join events
     participants = {}
-    active_talkers = {}
-    timeline = []
+    for event in root.findall(".//event[@module='PARTICIPANT'][@eventname='ParticipantJoinEvent']"):
+        u_id = event.findtext("userId")
+        name = event.findtext("name")
+        if u_id and name:
+            participants[u_id] = name
 
-    voice_events = root.findall(".//event[@module='VOICE']")
-    if not voice_events:
-        print("[Speaker Map] No VOICE events found in XML.")
+    # Check VOICE module join events (sometimes callernumber or participant is used)
+    for event in root.findall(".//event[@module='VOICE'][@eventname='ParticipantJoinedEvent']"):
+        p_id = event.findtext("participant")
+        caller_name = event.findtext("callername")
+        if p_id and caller_name:
+            participants[p_id] = caller_name
+
+    # 2. Find the exact StartRecordingEvent timestamp (t0 for audio.webm)
+    start_rec_event = root.find(".//event[@module='VOICE'][@eventname='StartRecordingEvent']")
+    if start_rec_event is None or start_rec_event.find("timestampUTC") is None:
+        print("[Speaker Map] Error: Could not find StartRecordingEvent timestampUTC.")
         return []
 
-    # Find the base timestamp (t0) from the very first voice event
-    first_ts = int(voice_events[0].get("timestamp", 0))
+    t0_ms = float(start_rec_event.findtext("timestampUTC"))
 
-    for event in voice_events:
-        event_name = event.get("eventname")
-        ts = int(event.get("timestamp", 0))
-        
-        # Calculate relative seconds from the start of the audio stream
-        rel_sec = max(0.0, (ts - first_ts) / 1000.0)
+    # 3. Track talking state and build intervals
+    active_talkers = {} # participant_id -> start_sec
+    timeline = []
 
-        if event_name == "ParticipantJoinedEvent":
-            # Map participant ID / caller number to display name
-            p_id = event.findtext("participant")
-            caller_num = event.findtext("callernumber", "")
-            name = event.findtext("callername", "Participant")
+    for event in root.findall(".//event[@module='VOICE'][@eventname='ParticipantTalkingEvent']"):
+        p_id = event.findtext("participant")
+        is_talking = event.findtext("talking", "false").lower() == "true"
+        ts_utc_node = event.find("timestampUTC")
 
-            if p_id:
-                participants[p_id] = name
-            if caller_num:
-                participants[caller_num] = name
+        if not p_id or ts_utc_node is None:
+            continue
 
-        elif event_name == "StartTalkingEvent":
-            p_id = event.findtext("participant")
-            if p_id:
-                active_talkers[p_id] = rel_sec
+        ts_ms = float(ts_utc_node.text)
+        # Calculate seconds from start of audio.webm
+        rel_sec = max(0.0, (ts_ms - t0_ms) / 1000.0)
 
-        elif event_name == "StopTalkingEvent":
-            p_id = event.findtext("participant")
+        if is_talking:
+            active_talkers[p_id] = rel_sec
+        else:
             if p_id in active_talkers:
                 start_sec = active_talkers.pop(p_id)
-                speaker_name = participants.get(p_id, "Participant")
-                
-                # Filter out automated BBB voice prompt events
-                if "LISTEN ONLY" not in speaker_name.upper():
-                    timeline.append({
-                        "start": start_sec,
-                        "end": rel_sec,
-                        "name": speaker_name
-                    })
+                speaker_name = participants.get(p_id, "Unknown Speaker")
+                timeline.append({
+                    "start": start_sec,
+                    "end": rel_sec,
+                    "name": speaker_name
+                })
 
-    print(f"[Speaker Map] Extracted {len(timeline)} talking segments from XML.")
+    # Close any talkers who were still talking when recording ended
+    for p_id, start_sec in active_talkers.items():
+        speaker_name = participants.get(p_id, "Unknown Speaker")
+        timeline.append({
+            "start": start_sec,
+            "end": start_sec + 5.0, # Default padding
+            "name": speaker_name
+        })
+
+    print(f"[Speaker Map] Successfully mapped {len(timeline)} voice intervals for {len(participants)} participants.")
     return timeline
-
 
 def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) -> str:
     """
