@@ -13,16 +13,24 @@ export HF_HOME="/var/bigbluebutton/hf_cache"
 export CF_ACCOUNT_ID="your_actual_account_id_here"
 export CF_API_TOKEN="your_actual_api_token_here"
 
-echo "[$(date)] Starting speaker-tagged transcription for ${MEETING_ID}..." >> "$LOG_FILE"
+# Locate the published WebM artifact directly (No raw audio dependency)
+WEBM_FILE=""
+if [ -f "${PUBLISHED_DIR}/video/webcams.webm" ]; then
+    WEBM_FILE="${PUBLISHED_DIR}/video/webcams.webm"
+elif [ -f "${PUBLISHED_DIR}/deskshare/deskshare.webm" ]; then
+    WEBM_FILE="${PUBLISHED_DIR}/deskshare/deskshare.webm"
+fi
 
-AUDIO_FILE="${RAW_DIR}/audio/audio.webm"
 EVENTS_XML="${RAW_DIR}/events.xml"
 
-if [ -f "$AUDIO_FILE" ]; then
-    nice -n 15 ionice -c 3 /opt/speech_env/bin/python3 /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py \
-        "$AUDIO_FILE" \
+echo "[$(date)] Starting published WebM transcription for ${MEETING_ID}..." >> "$LOG_FILE"
+
+if [ -n "$WEBM_FILE" ] && [ -f "$WEBM_FILE" ]; then
+    nice -n 15 ionice -c 3 /opt/speech_env/bin/python3 \
+        /usr/local/bigbluebutton/core/scripts/transcribe_meeting.py \
+        "$WEBM_FILE" \
         "$PUBLISHED_DIR" \
         "$EVENTS_XML" >> "$LOG_FILE" 2>&1
 else
-    echo "[$(date)] Error: Audio file $AUDIO_FILE not found." >> "$LOG_FILE"
+    echo "[$(date)] Error: Published WebM file not found in ${PUBLISHED_DIR}" >> "$LOG_FILE"
 fi
