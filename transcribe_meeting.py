@@ -1,3 +1,4 @@
+#/usr/local/bigbluebutton/core/scripts/post_publish/transcribe_meeting.py
 import sys
 import os
 import re
