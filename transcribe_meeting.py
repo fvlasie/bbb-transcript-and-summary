@@ -9,7 +9,7 @@ from faster_whisper import WhisperModel
 def parse_bbb_speaker_timeline(events_xml_path: str):
     """
     Parses BBB 3.x events.xml to map speaker names to audio timestamps 
-    relative to StartRecordingEvent (t0 for audio.webm).
+    relative to StartRecordingEvent (t0).
     """
     if not os.path.exists(events_xml_path):
         print(f"[Speaker Map] Warning: XML not found at {events_xml_path}. Skipping speaker attribution.")
@@ -71,7 +71,6 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
                     "name": speaker_name
                 })
 
-    # Flush active talkers if recording cut off mid-speech
     for p_id, start_sec in active_talkers.items():
         speaker_name = participants.get(p_id, "Unknown Speaker")
         timeline.append({"start": start_sec, "end": start_sec + 5.0, "name": speaker_name})
@@ -90,7 +89,6 @@ def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) 
         if interval["start"] <= midpoint <= interval["end"]:
             return interval["name"]
 
-    # Fuzzy buffer for minor VAD alignment drift
     for interval in timeline:
         if not (end_sec + 1.5 < interval["start"] or start_sec - 1.5 > interval["end"]):
             return interval["name"]
@@ -154,15 +152,7 @@ def generate_summary(transcript_text: str) -> str:
         "4. If a section has no meaningful content, explicitly write 'None'."
     )
 
-    user_prompt = (
-        "Summarize the following speaker-tagged meeting transcript accurately.\n\n"
-        "Formatting guidelines:\n"
-        "## Executive Summary\n"
-        "## Key Discussion Points\n"
-        "## Decisions Made\n"
-        "## Action Items & Next Steps\n\n"
-        f"TRANSCRIPT:\n{transcript_text}"
-    )
+    user_prompt = f"Summarize the following speaker-tagged meeting transcript accurately:\n\n{transcript_text}"
 
     payload = {
         "messages": [
@@ -195,30 +185,62 @@ def generate_summary(transcript_text: str) -> str:
     except Exception as e:
         return f"[Error generating summary: {e}]"
 
+def register_formats_in_metadata(output_dir: str, meeting_id: str):
+    """Appends transcript and summary links to BBB metadata.xml."""
+    meta_path = os.path.join(output_dir, "metadata.xml")
+    if not os.path.exists(meta_path):
+        return
+
+    try:
+        tree = ET.parse(meta_path)
+        root = tree.getroot()
+        
+        # Check or create <link> extensions or playback formats
+        meta_node = root.find("meta")
+        if meta_node is not None:
+            # Inject direct links into recording metadata
+            summary_link = meta_node.find("summary-url")
+            if summary_link is None:
+                summary_link = ET.SubElement(meta_node, "summary-url")
+            summary_link.text = f"/presentation/{meeting_id}/transcript_summary.txt"
+
+            transcript_link = meta_node.find("transcript-url")
+            if transcript_link is None:
+                transcript_link = ET.SubElement(meta_node, "transcript-url")
+            transcript_link.text = f"/presentation/{meeting_id}/transcript.vtt"
+
+            tree.write(meta_path)
+            print("[Metadata] Successfully registered summary and transcript in metadata.xml")
+    except Exception as e:
+        print(f"[Metadata] Warning: Failed to update metadata.xml: {e}")
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 transcribe_meeting.py <audio_file_path> <output_dir> [events_xml_path]")
+        print("Usage: python3 transcribe_meeting.py <webm_file_path> <output_dir> [events_xml_path]")
         sys.exit(1)
 
-    audio_path = sys.argv[1]
+    webm_path = sys.argv[1]
     output_dir = sys.argv[2]
     events_xml_path = sys.argv[3] if len(sys.argv) > 3 else ""
 
-    # 1. Extract speaker timeline from events.xml
+    if not os.path.exists(webm_path):
+        print(f"[Error] WebM file not found at: {webm_path}")
+        sys.exit(1)
+
+    # 1. Parse speaker timeline from events.xml
     timeline = parse_bbb_speaker_timeline(events_xml_path) if events_xml_path else []
 
-    # 2. Run Whisper transcription
+    # 2. Transcribe published WebM directly using faster-whisper
     print(f"[Whisper] Loading model 'medium'...")
     model = WhisperModel("medium", device="cpu", compute_type="int8", download_root="/var/bigbluebutton/hf_cache")
 
-    print(f"[Whisper] Transcribing {audio_path}...")
-    segments, _ = model.transcribe(audio_path, vad_filter=True, language="en")
+    print(f"[Whisper] Transcribing published WebM: {webm_path}...")
+    segments, _ = model.transcribe(webm_path, vad_filter=True, language="en")
 
     full_transcript = []
     vtt_lines = ["WEBVTT\n"]
 
-    # 3. Format WebVTT and Text with Speaker Tagging inline
+    # 3. Format WebVTT and TXT with speaker attribution
     for segment in segments:
         speaker = get_speaker_for_timestamp(segment.start, segment.end, timeline)
         speaker_prefix = f"[{speaker}]: " if speaker else ""
@@ -232,7 +254,7 @@ def main():
         text_line = f"{speaker_prefix}{raw_text}"
         full_transcript.append(text_line)
 
-        # WebVTT formatting (HH:MM:SS.mmm)
+        # WebVTT timestamp formatting (HH:MM:SS.mmm)
         start_fmt = f"{int(segment.start//3600):02d}:{int((segment.start%3600)//60):02d}:{segment.start%60:06.3f}"
         end_fmt = f"{int(segment.end//3600):02d}:{int((segment.end%3600)//60):02d}:{segment.end%60:06.3f}"
         
@@ -240,7 +262,7 @@ def main():
 
     full_text = "\n".join(full_transcript)
 
-    # 4. Save output files
+    # 4. Save output files to published directory
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "transcript.txt"), "w") as f:
         f.write(full_text + "\n")
