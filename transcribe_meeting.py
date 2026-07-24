@@ -186,34 +186,70 @@ def generate_summary(transcript_text: str) -> str:
         return f"[Error generating summary: {e}]"
 
 def register_formats_in_metadata(output_dir: str, meeting_id: str):
-    """Appends transcript and summary links to BBB metadata.xml."""
+    """Registers summary and transcript as playback formats and meta attributes in metadata.xml."""
     meta_path = os.path.join(output_dir, "metadata.xml")
     if not os.path.exists(meta_path):
+        print(f"[Metadata] Warning: metadata.xml not found at {meta_path}")
         return
 
     try:
         tree = ET.parse(meta_path)
         root = tree.getroot()
-        
-        # Check or create <link> extensions or playback formats
+
+        # Derive host URL if available from existing playback link
+        base_url = "https://bbb.spots.edu"  # Default fallback
+        playback_node = root.find("playback")
+        if playback_node is not None:
+            link_node = playback_node.find("link")
+            if link_node is not None and link_node.text:
+                # Extract scheme + domain (e.g., https://bbb.spots.edu)
+                match = re.match(r"(https?://[^/]+)", link_node.text)
+                if match:
+                    base_url = match.group(1)
+
+        summary_url = f"{base_url}/presentation/{meeting_id}/transcript_summary.txt"
+        transcript_url = f"{base_url}/presentation/{meeting_id}/transcript.txt"
+        vtt_url = f"{base_url}/presentation/{meeting_id}/transcript.vtt"
+
+        # 1. Update <meta> block
         meta_node = root.find("meta")
-        if meta_node is not None:
-            # Inject direct links into recording metadata
-            summary_link = meta_node.find("summary-url")
-            if summary_link is None:
-                summary_link = ET.SubElement(meta_node, "summary-url")
-            summary_link.text = f"/presentation/{meeting_id}/transcript_summary.txt"
+        if meta_node is None:
+            meta_node = ET.SubElement(root, "meta")
 
-            transcript_link = meta_node.find("transcript-url")
-            if transcript_link is None:
-                transcript_link = ET.SubElement(meta_node, "transcript-url")
-            transcript_link.text = f"/presentation/{meeting_id}/transcript.vtt"
+        def set_or_create(parent, tag_name, text_val):
+            node = parent.find(tag_name)
+            if node is None:
+                node = ET.SubElement(parent, tag_name)
+            node.text = text_val
 
-            tree.write(meta_path)
-            print("[Metadata] Successfully registered summary and transcript in metadata.xml")
+        set_or_create(meta_node, "summary-url", summary_url)
+        set_or_create(meta_node, "transcript-url", transcript_url)
+        set_or_create(meta_node, "caption-vtt-url", vtt_url)
+
+        # 2. Inject additional <format> entries inside <playback>
+        if playback_node is not None:
+            # Check existing format types to avoid duplicate tags on re-runs
+            existing_types = [
+                f.findtext("type") or f.text 
+                for f in playback_node.findall("format")
+            ]
+
+            if "summary" not in existing_types:
+                fmt_summary = ET.SubElement(playback_node, "format")
+                ET.SubElement(fmt_summary, "type").text = "summary"
+                ET.SubElement(fmt_summary, "url").text = summary_url
+
+            if "transcript" not in existing_types:
+                fmt_transcript = ET.SubElement(playback_node, "format")
+                ET.SubElement(fmt_transcript, "type").text = "transcript"
+                ET.SubElement(fmt_transcript, "url").text = transcript_url
+
+        tree.write(meta_path, encoding="UTF-8", xml_declaration=True)
+        print("[Metadata] Successfully registered summary & transcript formats in metadata.xml")
+
     except Exception as e:
-        print(f"[Metadata] Warning: Failed to update metadata.xml: {e}")
-
+        print(f"[Metadata] Error updating metadata.xml: {e}")
+        
 def main():
     if len(sys.argv) < 3:
         print("Usage: python3 transcribe_meeting.py <webm_file_path> <output_dir> [events_xml_path]")
