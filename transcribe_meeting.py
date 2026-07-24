@@ -186,7 +186,11 @@ def generate_summary(transcript_text: str) -> str:
         return f"[Error generating summary: {e}]"
 
 def register_formats_in_metadata(output_dir: str, meeting_id: str):
-    """Registers summary and transcript in metadata.xml following standard BBB flat format schemas."""
+    """
+    Registers custom formats (summary and transcript) in metadata.xml
+    following standard BigBlueButton <playback><format> schema so Greenlight
+    and Scalelite can parse them automatically.
+    """
     meta_path = os.path.join(output_dir, "metadata.xml")
     if not os.path.exists(meta_path):
         print(f"[Metadata] Warning: metadata.xml not found at {meta_path}")
@@ -196,11 +200,12 @@ def register_formats_in_metadata(output_dir: str, meeting_id: str):
         tree = ET.parse(meta_path)
         root = tree.getroot()
 
-        # Derive domain from existing link
+        # Derive domain from existing playback link
         base_url = "https://bbb.spots.edu"
         playback_node = root.find("playback")
         if playback_node is not None:
-            link_node = playback_node.find("link")
+            # Check existing format links first
+            link_node = playback_node.find(".//url") or playback_node.find("link")
             if link_node is not None and link_node.text:
                 match = re.match(r"(https?://[^/]+)", link_node.text)
                 if match:
@@ -210,7 +215,7 @@ def register_formats_in_metadata(output_dir: str, meeting_id: str):
         transcript_url = f"{base_url}/presentation/{meeting_id}/transcript.txt"
         vtt_url = f"{base_url}/presentation/{meeting_id}/transcript.vtt"
 
-        # 1. Update <meta> node with custom fields
+        # 1. Update <meta> node for custom internal/API metadata querying
         meta_node = root.find("meta")
         if meta_node is None:
             meta_node = ET.SubElement(root, "meta")
@@ -225,24 +230,38 @@ def register_formats_in_metadata(output_dir: str, meeting_id: str):
         set_or_update(meta_node, "transcript-url", transcript_url)
         set_or_update(meta_node, "caption-vtt-url", vtt_url)
 
-        # 2. Add flat <format> tags to <playback>
+        # 2. Add nested <format> blocks inside <playback>
         if playback_node is not None:
-            existing_formats = [f.text for f in playback_node.findall("format") if f.text]
+            # Collect existing format types (checking nested <type> tags)
+            existing_types = []
+            for fmt in playback_node.findall("format"):
+                t_node = fmt.find("type")
+                if t_node is not None and t_node.text:
+                    existing_types.append(t_node.text)
 
-            if "summary" not in existing_formats:
-                fmt_s = ET.SubElement(playback_node, "format")
-                fmt_s.text = "summary"
+            def add_format_block(fmt_type: str, fmt_url: str):
+                if fmt_type not in existing_types:
+                    fmt_elem = ET.SubElement(playback_node, "format")
+                    
+                    type_elem = ET.SubElement(fmt_elem, "type")
+                    type_elem.text = fmt_type
+                    
+                    url_elem = ET.SubElement(fmt_elem, "url")
+                    url_elem.text = fmt_url
+                    
+                    # Optional: Greenlight accepts length/processing time
+                    len_elem = ET.SubElement(fmt_elem, "length")
+                    len_elem.text = "0"
 
-            if "transcript" not in existing_formats:
-                fmt_t = ET.SubElement(playback_node, "format")
-                fmt_t.text = "transcript"
+            add_format_block("summary", summary_url)
+            add_format_block("transcript", transcript_url)
 
-            # Also add direct format links inside playback if required by API readers
-            set_or_update(playback_node, "link_summary", summary_url)
-            set_or_update(playback_node, "link_transcript", transcript_url)
+        # Format XML output neatly (Python 3.9+)
+        if hasattr(ET, "indent"):
+            ET.indent(tree, space="  ")
 
         tree.write(meta_path, encoding="UTF-8", xml_declaration=True)
-        print("[Metadata] Successfully updated metadata.xml with flat format tags.")
+        print("[Metadata] Successfully registered nested formats in metadata.xml.")
 
     except Exception as e:
         print(f"[Metadata] Error updating metadata.xml: {e}")
