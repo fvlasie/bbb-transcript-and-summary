@@ -6,13 +6,15 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from faster_whisper import WhisperModel
 
+import xml.etree.ElementTree as ET
+
 def parse_bbb_speaker_timeline(events_xml_path: str):
     """
-    Parses BBB events.xml to build a list of talking intervals:
-    [{'start': float_sec, 'end': float_sec, 'name': str}]
+    Parses BBB events.xml and normalizes relative millisecond timestamps
+    to align cleanly with Whisper's 00:00:00 start.
     """
     if not os.path.exists(events_xml_path):
-        print(f"[Speaker Map] Warning: {events_xml_path} not found. Skipping speaker tagging.")
+        print(f"[Speaker Map] Warning: {events_xml_path} not found.")
         return []
 
     try:
@@ -22,29 +24,35 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
         print(f"[Speaker Map] Error parsing XML: {e}")
         return []
 
-    # Map participant ID -> Caller Name
     participants = {}
-    # Track active talking start times: participant_id -> start_sec
     active_talkers = {}
     timeline = []
 
-    # Get the recording start time (events timestamps are relative or epoch)
-    # Most VOICE events use relative milliseconds from meeting start or Unix epoch.
-    start_event = root.find(".//event[@eventname='RecordStatusEvent']")
-    meeting_start_ts = int(start_event.get("timestamp")) if start_event is not None else 0
+    voice_events = root.findall(".//event[@module='VOICE']")
+    if not voice_events:
+        print("[Speaker Map] No VOICE events found in XML.")
+        return []
 
-    for event in root.findall(".//event[@module='VOICE']"):
+    # Find the base timestamp (t0) from the very first voice event
+    first_ts = int(voice_events[0].get("timestamp", 0))
+
+    for event in voice_events:
         event_name = event.get("eventname")
         ts = int(event.get("timestamp", 0))
         
-        # Convert timestamp to relative seconds from meeting start if using epoch
-        rel_sec = (ts - meeting_start_ts) / 1000.0 if meeting_start_ts > 0 else ts / 1000.0
+        # Calculate relative seconds from the start of the audio stream
+        rel_sec = max(0.0, (ts - first_ts) / 1000.0)
 
         if event_name == "ParticipantJoinedEvent":
+            # Map participant ID / caller number to display name
             p_id = event.findtext("participant")
-            name = event.findtext("callername", "Unknown Speaker")
+            caller_num = event.findtext("callernumber", "")
+            name = event.findtext("callername", "Participant")
+
             if p_id:
                 participants[p_id] = name
+            if caller_num:
+                participants[caller_num] = name
 
         elif event_name == "StartTalkingEvent":
             p_id = event.findtext("participant")
@@ -55,35 +63,40 @@ def parse_bbb_speaker_timeline(events_xml_path: str):
             p_id = event.findtext("participant")
             if p_id in active_talkers:
                 start_sec = active_talkers.pop(p_id)
-                speaker_name = participants.get(p_id, f"Participant {p_id}")
-                timeline.append({
-                    "start": start_sec,
-                    "end": rel_sec,
-                    "name": speaker_name
-                })
+                speaker_name = participants.get(p_id, "Participant")
+                
+                # Filter out automated BBB voice prompt events
+                if "LISTEN ONLY" not in speaker_name.upper():
+                    timeline.append({
+                        "start": start_sec,
+                        "end": rel_sec,
+                        "name": speaker_name
+                    })
 
+    print(f"[Speaker Map] Extracted {len(timeline)} talking segments from XML.")
     return timeline
 
 
 def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) -> str:
     """
-    Finds the speaker who was talking during [start_sec, end_sec].
+    Finds the speaker active during [start_sec, end_sec] with fuzzy tolerance.
     """
     if not timeline:
         return ""
 
     midpoint = (start_sec + end_sec) / 2.0
+    
+    # 1. Direct overlap check
     for interval in timeline:
         if interval["start"] <= midpoint <= interval["end"]:
             return interval["name"]
 
-    # Fallback: check overlapping intervals
+    # 2. Fuzzy match within a 1.5-second buffer (handles slight VAD drift)
     for interval in timeline:
-        if not (end_sec < interval["start"] or start_sec > interval["end"]):
+        if not (end_sec + 1.5 < interval["start"] or start_sec - 1.5 > interval["end"]):
             return interval["name"]
 
-    return "Unknown"
-
+    return ""
 
 def get_best_active_cf_model(account_id: str, api_token: str) -> str:
     catalog_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?task=Text%20Generation"
