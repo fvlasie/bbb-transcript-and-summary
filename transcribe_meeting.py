@@ -1,4 +1,3 @@
-#/usr/local/bigbluebutton/core/scripts/post_publish/lib/transcribe_meeting.py
 import sys
 import os
 import re
@@ -187,7 +186,7 @@ def generate_summary(transcript_text: str) -> str:
         return f"[Error generating summary: {e}]"
 
 def register_formats_in_metadata(output_dir: str, meeting_id: str):
-    """Registers summary and transcript as playback formats and meta attributes in metadata.xml."""
+    """Registers summary and transcript in metadata.xml following standard BBB flat format schemas."""
     meta_path = os.path.join(output_dir, "metadata.xml")
     if not os.path.exists(meta_path):
         print(f"[Metadata] Warning: metadata.xml not found at {meta_path}")
@@ -197,13 +196,12 @@ def register_formats_in_metadata(output_dir: str, meeting_id: str):
         tree = ET.parse(meta_path)
         root = tree.getroot()
 
-        # Derive host URL if available from existing playback link
-        base_url = "https://bbb.spots.edu"  # Default fallback
+        # Derive domain from existing link
+        base_url = "https://bbb.spots.edu"
         playback_node = root.find("playback")
         if playback_node is not None:
             link_node = playback_node.find("link")
             if link_node is not None and link_node.text:
-                # Extract scheme + domain (e.g., https://bbb.spots.edu)
                 match = re.match(r"(https?://[^/]+)", link_node.text)
                 if match:
                     base_url = match.group(1)
@@ -212,45 +210,43 @@ def register_formats_in_metadata(output_dir: str, meeting_id: str):
         transcript_url = f"{base_url}/presentation/{meeting_id}/transcript.txt"
         vtt_url = f"{base_url}/presentation/{meeting_id}/transcript.vtt"
 
-        # 1. Update <meta> block
+        # 1. Update <meta> node with custom fields
         meta_node = root.find("meta")
         if meta_node is None:
             meta_node = ET.SubElement(root, "meta")
 
-        def set_or_create(parent, tag_name, text_val):
-            node = parent.find(tag_name)
+        def set_or_update(parent, tag, value):
+            node = parent.find(tag)
             if node is None:
-                node = ET.SubElement(parent, tag_name)
-            node.text = text_val
+                node = ET.SubElement(parent, tag)
+            node.text = value
 
-        set_or_create(meta_node, "summary-url", summary_url)
-        set_or_create(meta_node, "transcript-url", transcript_url)
-        set_or_create(meta_node, "caption-vtt-url", vtt_url)
+        set_or_update(meta_node, "summary-url", summary_url)
+        set_or_update(meta_node, "transcript-url", transcript_url)
+        set_or_update(meta_node, "caption-vtt-url", vtt_url)
 
-        # 2. Inject additional <format> entries inside <playback>
+        # 2. Add flat <format> tags to <playback>
         if playback_node is not None:
-            # Check existing format types to avoid duplicate tags on re-runs
-            existing_types = [
-                f.findtext("type") or f.text 
-                for f in playback_node.findall("format")
-            ]
+            existing_formats = [f.text for f in playback_node.findall("format") if f.text]
 
-            if "summary" not in existing_types:
-                fmt_summary = ET.SubElement(playback_node, "format")
-                ET.SubElement(fmt_summary, "type").text = "summary"
-                ET.SubElement(fmt_summary, "url").text = summary_url
+            if "summary" not in existing_formats:
+                fmt_s = ET.SubElement(playback_node, "format")
+                fmt_s.text = "summary"
 
-            if "transcript" not in existing_types:
-                fmt_transcript = ET.SubElement(playback_node, "format")
-                ET.SubElement(fmt_transcript, "type").text = "transcript"
-                ET.SubElement(fmt_transcript, "url").text = transcript_url
+            if "transcript" not in existing_formats:
+                fmt_t = ET.SubElement(playback_node, "format")
+                fmt_t.text = "transcript"
+
+            # Also add direct format links inside playback if required by API readers
+            set_or_update(playback_node, "link_summary", summary_url)
+            set_or_update(playback_node, "link_transcript", transcript_url)
 
         tree.write(meta_path, encoding="UTF-8", xml_declaration=True)
-        print("[Metadata] Successfully registered summary & transcript formats in metadata.xml")
+        print("[Metadata] Successfully updated metadata.xml with flat format tags.")
 
     except Exception as e:
         print(f"[Metadata] Error updating metadata.xml: {e}")
-        
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: python3 transcribe_meeting.py <webm_file_path> <output_dir> [events_xml_path]")
@@ -315,6 +311,14 @@ def main():
         f.write(summary + "\n")
 
     print("[Complete] Processing finished successfully.")
+
+    # 6. Register formats in metadata.xml
+    meeting_id = os.path.basename(os.path.normpath(output_dir))
+    if os.path.exists(os.path.join(output_dir, "metadata.xml")):
+        print(f"[Metadata] Updating metadata for meeting {meeting_id} at: {output_dir}")
+        register_formats_in_metadata(output_dir, meeting_id)
+    else:
+        print(f"[Metadata] Warning: metadata.xml not found in {output_dir}. Skipping registration.")
 
 if __name__ == "__main__":
     main()
