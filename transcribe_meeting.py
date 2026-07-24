@@ -1,70 +1,127 @@
-#!/usr/bin/env /opt/speech_env/bin/python3
 import sys
 import os
-import glob
-import time
+import re
 import json
 import urllib.request
-import urllib.error
-import re
+import xml.etree.ElementTree as ET
 from faster_whisper import WhisperModel
 
-os.environ["HF_HUB_CACHE"] = "/var/bigbluebutton/hf_cache"
+def parse_bbb_speaker_timeline(events_xml_path: str):
+    """
+    Parses BBB events.xml to build a list of talking intervals:
+    [{'start': float_sec, 'end': float_sec, 'name': str}]
+    """
+    if not os.path.exists(events_xml_path):
+        print(f"[Speaker Map] Warning: {events_xml_path} not found. Skipping speaker tagging.")
+        return []
 
-def format_timestamp(seconds: float) -> str:
-    hrs = int(seconds // 3600)
-    mins = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    msecs = int((seconds % 1) * 1000)
-    return f"{hrs:02d}:{mins:02d}:{secs:02d}.{msecs:03d}"
+    try:
+        tree = ET.parse(events_xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        print(f"[Speaker Map] Error parsing XML: {e}")
+        return []
+
+    # Map participant ID -> Caller Name
+    participants = {}
+    # Track active talking start times: participant_id -> start_sec
+    active_talkers = {}
+    timeline = []
+
+    # Get the recording start time (events timestamps are relative or epoch)
+    # Most VOICE events use relative milliseconds from meeting start or Unix epoch.
+    start_event = root.find(".//event[@eventname='RecordStatusEvent']")
+    meeting_start_ts = int(start_event.get("timestamp")) if start_event is not None else 0
+
+    for event in root.findall(".//event[@module='VOICE']"):
+        event_name = event.get("eventname")
+        ts = int(event.get("timestamp", 0))
+        
+        # Convert timestamp to relative seconds from meeting start if using epoch
+        rel_sec = (ts - meeting_start_ts) / 1000.0 if meeting_start_ts > 0 else ts / 1000.0
+
+        if event_name == "ParticipantJoinedEvent":
+            p_id = event.findtext("participant")
+            name = event.findtext("callername", "Unknown Speaker")
+            if p_id:
+                participants[p_id] = name
+
+        elif event_name == "StartTalkingEvent":
+            p_id = event.findtext("participant")
+            if p_id:
+                active_talkers[p_id] = rel_sec
+
+        elif event_name == "StopTalkingEvent":
+            p_id = event.findtext("participant")
+            if p_id in active_talkers:
+                start_sec = active_talkers.pop(p_id)
+                speaker_name = participants.get(p_id, f"Participant {p_id}")
+                timeline.append({
+                    "start": start_sec,
+                    "end": rel_sec,
+                    "name": speaker_name
+                })
+
+    return timeline
+
+
+def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) -> str:
+    """
+    Finds the speaker who was talking during [start_sec, end_sec].
+    """
+    if not timeline:
+        return ""
+
+    midpoint = (start_sec + end_sec) / 2.0
+    for interval in timeline:
+        if interval["start"] <= midpoint <= interval["end"]:
+            return interval["name"]
+
+    # Fallback: check overlapping intervals
+    for interval in timeline:
+        if not (end_sec < interval["start"] or start_sec > interval["end"]):
+            return interval["name"]
+
+    return "Unknown"
+
 
 def get_best_active_cf_model(account_id: str, api_token: str) -> str:
-    """
-    Queries Cloudflare's model catalog dynamically to find an active
-    text generation model. Falls back to a safe default if lookup fails.
-    """
     catalog_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?task=Text%20Generation"
-    
     try:
-        req = urllib.request.Request(
-            catalog_url,
-            headers={"Authorization": f"Bearer {api_token}"}
-        )
+        req = urllib.request.Request(catalog_url, headers={"Authorization": f"Bearer {api_token}"})
         with urllib.request.urlopen(req, timeout=10) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             if res_data.get("success"):
                 models = res_data.get("result", [])
-                
-                # Filter for Cloudflare-hosted models (@cf/) that are not deprecated
                 valid_models = [
                     m["name"] for m in models 
                     if m.get("name", "").startswith("@cf/") and not m.get("description", "").lower().startswith("deprecated")
                 ]
-                
                 if valid_models:
-                    # Prefer Llama 3.x / GLM models if available, otherwise grab the first active text model
-                    for preferred in ["llama-3.2", "llama-3.3", "glm-4"]:
+                    priority_order = ["llama-3.3-70b", "llama-3.1-70b", "qwen2.5-72b", "llama-3.2-3b", "glm-4"]
+                    for preferred in priority_order:
                         for m in valid_models:
                             if preferred in m:
-                                print(f"[Catalog] Automatically selected model: {m}")
+                                print(f"[Catalog] Selected model: {m}")
                                 return m
-                    
-                    selected = valid_models[0]
-                    print(f"[Catalog] Automatically selected model: {selected}")
-                    return selected
-
+                    return valid_models[0]
     except Exception as e:
-        print(f"[Warning] Failed to query Cloudflare model catalog ({e}). Falling back to default.")
+        print(f"[Warning] Catalog query failed ({e}). Using default fallback.")
 
-    # Safe fallback if catalog API query fails
-    return "@cf/meta/llama-3.2-3b-instruct"
+    return "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 
 
 def generate_summary(transcript_text: str) -> str:
-    """
-    Generates meeting summary by dynamically picking an active model from Cloudflare.
-    Strips out conversational intros/preambles for a clean final output.
-    """
+    words = transcript_text.strip().split()
+    if len(words) < 8:
+        return (
+            "## Executive Summary\n"
+            "No active meeting discussion recorded (empty transcript or automated prompt).\n\n"
+            "## Key Discussion Points\nNone\n\n"
+            "## Decisions Made\nNone\n\n"
+            "## Action Items & Next Steps\nNone"
+        )
+
     account_id = os.environ.get("CF_ACCOUNT_ID")
     api_token = os.environ.get("CF_API_TOKEN")
 
@@ -74,21 +131,21 @@ def generate_summary(transcript_text: str) -> str:
     model = get_best_active_cf_model(account_id, api_token)
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
-    # Explicitly instruct the model to skip introductory/conversational remarks
     system_prompt = (
-        "You are an executive assistant. Your task is to provide a clean meeting summary. "
-        "Do NOT include conversational intros, headers like 'Here is a summary', or meta-commentary. "
-        "Begin immediately with the Executive Summary."
+        "You are an executive assistant. Your task is to provide a clean, accurate meeting summary based on speaker-attributed transcripts. "
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. Do NOT include conversational intros or preambles (e.g., 'Here is a summary'). Start directly with '## Executive Summary'.\n"
+        "2. Do NOT inflate brief off-hand remarks, mic checks, or automated prompts into major discussion points.\n"
+        "3. Attribute key points or action items to specific speakers if mentioned in the transcript.\n"
+        "4. If a section has no meaningful content, explicitly write 'None'."
     )
 
     user_prompt = (
-        "Summarize the following meeting transcript.\n\n"
+        "Summarize the following speaker-tagged meeting transcript accurately.\n\n"
         "Formatting guidelines:\n"
         "## Executive Summary\n"
-        "(2-3 concise sentences)\n\n"
         "## Key Discussion Points\n"
-        "(bullet points)\n\n"
-        "## Decisions Made\n\n"
+        "## Decisions Made\n"
         "## Action Items & Next Steps\n\n"
         f"TRANSCRIPT:\n{transcript_text}"
     )
@@ -114,86 +171,71 @@ def generate_summary(transcript_text: str) -> str:
             res_data = json.loads(response.read().decode("utf-8"))
             if res_data.get("success"):
                 raw_summary = res_data.get("result", {}).get("response", "")
-                
-                # Regex fallback: strips common intro phrases if the model ignores the prompt instruction
-                cleaned_summary = re.sub(
+                cleaned = re.sub(
                     r"^(here is (a|the) summary[^\n]*\n?|sure[^\n]*\n?|certainly[^\n]*\n?)", 
                     "", 
                     raw_summary, 
                     flags=re.IGNORECASE
                 ).strip()
-
-                return cleaned_summary
+                return cleaned
             else:
-                errors = res_data.get("errors", [])
-                return f"[Cloudflare API Error: {errors}]"
+                return f"[Cloudflare API Error: {res_data.get('errors')}]"
 
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        return f"[HTTP Error {e.code}: {error_body}]"
     except Exception as e:
         return f"[Error generating summary: {e}]"
-        
-def process_recording(meeting_id):
-    publish_dir = f"/var/bigbluebutton/published/presentation/{meeting_id}"
-    
-    if not os.path.exists(publish_dir):
-        print(f"[Error] Publish directory not found: {publish_dir}")
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python3 transcribe_meeting.py <audio_file_path> <output_dir> [events_xml_path]")
         sys.exit(1)
 
-    audio_candidates = (
-        glob.glob(f"{publish_dir}/video/webcams.webm") +
-        glob.glob(f"{publish_dir}/audio/audio.webm") +
-        glob.glob(f"{publish_dir}/audio/audio.wav")
-    )
+    audio_path = sys.argv[1]
+    output_dir = sys.argv[2]
+    events_xml_path = sys.argv[3] if len(sys.argv) > 3 else ""
 
-    if not audio_candidates:
-        print(f"[Error] No supported audio/video files found for meeting {meeting_id}")
-        sys.exit(1)
+    print(f"[Whisper] Loading model 'medium'...")
+    model = WhisperModel("medium", device="cpu", compute_type="int8", download_root="/var/bigbluebutton/hf_cache")
 
-    audio_file = audio_candidates[0]
-    print(f"[Transcribe] Processing file: {audio_file}")
+    print(f"[Whisper] Transcribing {audio_path}...")
+    segments, _ = model.transcribe(audio_path, vad_filter=True, language="en")
 
-    model = WhisperModel("medium", device="cpu", compute_type="int8", cpu_threads=6)
-
-    start_time = time.time()
-    segments, info = model.transcribe(audio_file, beam_size=5, vad_filter=True)
-
-    vtt_path = f"{publish_dir}/transcript.vtt"
-    txt_path = f"{publish_dir}/transcript.txt"
-    summary_path = f"{publish_dir}/transcript_summary.txt"
+    # Parse speaker timeline from events.xml
+    timeline = parse_bbb_speaker_timeline(events_xml_path) if events_xml_path else []
 
     full_transcript = []
+    vtt_lines = ["WEBVTT\n"]
 
-    with open(vtt_path, "w", encoding="utf-8") as vtt_file, \
-         open(txt_path, "w", encoding="utf-8") as txt_file:
+    for segment in segments:
+        speaker = get_speaker_for_timestamp(segment.start, segment.end, timeline)
+        speaker_prefix = f"[{speaker}]: " if speaker else ""
         
-        vtt_file.write("WEBVTT\n\n")
+        text_line = f"{speaker_prefix}{segment.text.strip()}"
+        full_transcript.append(text_line)
 
-        for segment in segments:
-            start_str = format_timestamp(segment.start)
-            end_str = format_timestamp(segment.end)
-            text = segment.text.strip()
-            
-            vtt_file.write(f"{start_str} --> {end_str}\n{text}\n\n")
-            txt_file.write(f"[{start_str}] {text}\n")
-            full_transcript.append(f"[{start_str}] {text}")
+        # Format WebVTT timestamps (HH:MM:SS.mmm)
+        start_fmt = f"{int(segment.start//3600):02d}:{int((segment.start%3600)//60):02d}:{segment.start%60:06.3f}"
+        end_fmt = f"{int(segment.end//3600):02d}:{int((segment.end%3600)//60):02d}:{segment.end%60:06.3f}"
+        
+        vtt_lines.append(f"{start_fmt} --> {end_fmt}\n{text_line}\n")
 
-    print(f"[Transcribe] Finished in {time.time() - start_time:.2f}s.")
+    full_text = "\n".join(full_transcript)
 
-    # --- Summarization Step ---
-    print("[Summary] Generating meeting summary via Cloudflare Workers AI...")
-    raw_text = "\n".join(full_transcript)
-    summary = generate_summary(raw_text)
+    # Save transcript files
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "transcript.txt"), "w") as f:
+        f.write(full_text)
 
-    with open(summary_path, "w", encoding="utf-8") as summary_file:
-        summary_file.write(summary)
+    with open(os.path.join(output_dir, "transcript.vtt"), "w") as f:
+        f.write("\n".join(vtt_lines))
 
-    print(f"[Summary] Saved to: {summary_path}")
+    print("[Summary] Generating AI meeting summary...")
+    summary = generate_summary(full_text)
+
+    with open(os.path.join(output_dir, "transcript_summary.txt"), "w") as f:
+        f.write(summary)
+
+    print("[Complete] Processing finished successfully.")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 transcribe_meeting.py <meeting_id>")
-        sys.exit(1)
-
-    process_recording(sys.argv[1])
+    main()
