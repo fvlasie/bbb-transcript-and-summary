@@ -64,6 +64,6 @@ To manually test or re-process a past meeting recording:
 ```bash
 # Form: /opt/speech_env/bin/python3 transcribe_meeting.py <MEETING_ID>
 /opt/speech_env/bin/python3 transcribe_meeting.py 2187398764890732491623487923249-972314691
-
+```
 ## 📄 License
 Distributed under the MIT License. Feel free to modify and adapt for your institutional BigBlueButton deployment.
