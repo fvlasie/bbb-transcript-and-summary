@@ -1,5 +1,5 @@
 # 1. Ensure system audio tools & FFmpeg are present
-sudo apt update && sudo apt install -y python3.10-venv python3-pip ffmpeg portaudio19-dev
+sudo apt update && sudo apt install -y python3.10-venv python3-pip ffmpeg portaudio19-dev markdown
 
 # 2. Create and activate a dedicated virtual environment
 python3 -m venv speech_env
