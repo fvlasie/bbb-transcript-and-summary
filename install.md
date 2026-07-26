@@ -39,6 +39,11 @@ sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/published/transcrip
 
 sudo chmod -R 775 /var/bigbluebutton/published/summary
 sudo chmod -R 775 /var/bigbluebutton/published/transcript
+
 # Re-verify the large cache folder is owned by BBB
 sudo mkdir -p /home/bigbluebutton/.cache
 sudo chown -R bigbluebutton:bigbluebutton /var/bigbluebutton/hf_cache
+
+# Execute from the ruby trigger (add this to /usr/local/bigbluebutton/core/scripts/post_publish/post_publish.rb)
+logger.info("Executing Whisper transcription for meeting: #{meeting_id}")
+system("/usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh #{meeting_id}")
