@@ -2,14 +2,14 @@
 
 A lightweight, fully native post-processing pipeline for BigBlueButton (BBB) 3.0 that automatically generates speaker-attributed transcripts and formatted AI summaries upon recording completion.
 
-Artifacts are delivered directly via the default BBB presentation playback layer (`/presentation/<meeting_id>/`), requiring zero manual Nginx route changes.
+Artefacts are delivered directly via the default BBB presentation playback layer (`/presentation/<meeting_id>/`), requiring zero manual Nginx route changes.
 
 ---
 
 ## 🌟 Key Features
 
-* **Local Speech-to-Text (`faster-whisper`)**: High-speed, int8-quantized `large-v3-turbo` model executing at ~0.4x real-time on CPU.
-* **Speaker Attribution**: Cross-references BBB `events.xml` timestamps with audio segments to automatically identify speaker names in transcript logs.
+* **Local Speech-to-Text (`faster-whisper`)**: High-speed, int8-quantized `large-v3-turbo` model executing at ~0.4x real-time on Xeon Silver CPU.
+* **Speaker Attribution**: Cross-references BBB `events.xml` timestamps with audio segments automatically to identify speaker names in transcript logs.
 * **AI Meeting Summaries**: Generates structured Markdown, HTML, and dynamic downloadable RTF summaries via Cloudflare Workers AI.
 * **Native BBB Integration**: Registers custom formats (`summary` and `transcript`) directly into BBB metadata so front-ends like Greenlight automatically display valid playback links.
 * **Zero Nginx Configuration**: Files are hosted inside standard presentation folders, avoiding routing conflicts and custom web server hacks.
@@ -42,13 +42,13 @@ Artifacts are delivered directly via the default BBB presentation playback layer
          └── 5. Register native playback URLs in metadata.xml
          │
          ▼
-[Published Artifacts] Available natively at https://bbb.yourdomain.com/presentation/<meeting_id>/...
+[Published Artefacts] Available natively at https://bbb.yourdomain.com/presentation/<meeting_id>/...
 ```
 ---
 
 ## 🚀 Quick Setup & Installation
 
-Detailed instructions for dependencies, virtual environments, permissions, and BBB post-publish registration are documented in **[`install.md`](./install.md)**.
+Detailed instructions for dependencies, venvs, permissions, and BBB post-publish registration are documented in **[`install.md`](./install.md)**.
 
 ### General Highlights:
 1. Python dependencies (e.g., `faster-whisper`, `markdown`) are isolated in `/opt/speech_env/`.
@@ -66,4 +66,4 @@ To manually test or re-process a past meeting recording:
 /opt/speech_env/bin/python3 transcribe_meeting.py 2187398764890732491623487923249-972314691
 ```
 ## 📄 License
-Distributed under the MIT License. Feel free to modify and adapt for your institutional BigBlueButton deployment.
+Distributed under the MIT License. Feel free to modify and adapt for your own BigBlueButton deployment.
