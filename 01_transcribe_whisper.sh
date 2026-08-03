@@ -4,12 +4,12 @@
 MEETING_ID=$1
 LOG_FILE="/var/log/bigbluebutton/post_publish_transcribe.log"
 
-# Localized cache directory for Whisper model weights
+# Localized cache directory for both Whisper and Llama models
 export HF_HOME="/var/bigbluebutton/hf_cache"
 
-# Cloudflare Workers AI Credentials
-export CF_ACCOUNT_ID="your_actual_account_id_here"
-export CF_API_TOKEN="your_actual_api_token_here"
+# Llama 2 13B Chat (best quality for meeting context/nuance)
+export LLAMA_REPO_ID="TheBloke/Llama-2-13B-chat-GGUF"
+export LLAMA_FILENAME="llama-2-13b-chat.Q4_K_M.gguf"
 
 echo "[$(date)] Starting published WebM transcription for ${MEETING_ID}..." >> "$LOG_FILE"
 

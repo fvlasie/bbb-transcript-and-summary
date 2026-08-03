@@ -1,6 +1,6 @@
 # BigBlueButton 3.0 Native Transcription & AI Summarization Pipeline
 
-A lightweight, fully native post-processing pipeline for BigBlueButton (BBB) 3.0 that automatically generates speaker-attributed transcripts and formatted AI summaries upon recording completion.
+A lightweight, fully native post-processing pipeline for BigBlueButton (BBB) 3.0 that automatically generates speaker-attributed transcripts and formatted AI summaries upon recording completion using a **local LLM** backend.
 
 Artefacts are delivered directly via the default BBB presentation playback layer (`/presentation/<meeting_id>/`), requiring zero manual Nginx route changes.
 
@@ -10,7 +10,7 @@ Artefacts are delivered directly via the default BBB presentation playback layer
 
 * **Local Speech-to-Text (`faster-whisper`)**: High-speed, int8-quantized `large-v3-turbo` model executing at ~0.4x real-time on Xeon Silver CPU.
 * **Speaker Attribution**: Cross-references BBB `events.xml` timestamps with audio segments automatically to identify speaker names in transcript logs.
-* **AI Meeting Summaries**: Generates structured Markdown, HTML, and dynamic downloadable RTF summaries via Cloudflare Workers AI.
+* **Local LLM Summaries**: Generates structured Markdown summaries using `llama-cpp-python` with a locally-hosted GGUF model (no external API calls).
 * **Native BBB Integration**: Registers custom formats (`summary` and `transcript`) directly into BBB metadata so front-ends like Greenlight automatically display valid playback links.
 * **Zero Nginx Configuration**: Files are hosted inside standard presentation folders, avoiding routing conflicts and custom web server hacks.
 
@@ -38,7 +38,7 @@ Artefacts are delivered directly via the default BBB presentation playback layer
          ├── 1. Parse timeline from events.xml (Speaker attribution)
          ├── 2. Transcribe WebM using faster-whisper (large-v3-turbo)
          ├── 3. Output WebVTT & Speaker TXT -> /presentation/<meeting_id>/transcript/
-         ├── 4. Summarize via Cloudflare Workers AI -> HTML & RTF
+         ├── 4. Summarize via local Llama model -> HTML & RTF
          └── 5. Register native playback URLs in metadata.xml
          │
          ▼
