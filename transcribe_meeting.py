@@ -323,10 +323,50 @@ def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) 
     return ""
 
 
+def _summarize_llama(llm, system_prompt: str, transcript_text: str, is_chunk: bool = False) -> str:
+    """
+    Internal helper: Summarize transcript using an already-loaded Llama model.
+    is_chunk=True adjusts prompt for chunk summaries.
+    """
+    if is_chunk:
+        user_prompt = f"Summarize this section of a meeting transcript (this is one section of a longer meeting):\n\n{transcript_text}"
+    else:
+        user_prompt = f"Summarize this meeting transcript:\n\n{transcript_text}"
+
+    # Format prompt using Llama 2 Chat template
+    formatted_prompt = (
+        f"[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_prompt} [/INST]"
+    )
+
+    response = llm(
+        formatted_prompt,
+        max_tokens=1024,
+        temperature=0.7,
+        top_p=0.95,
+        stop=["[/INST]"]
+    )
+
+    raw_summary = response.get("choices", [{}])[0].get("text", "").strip()
+    
+    if not raw_summary:
+        return ""
+
+    # Clean up any preamble
+    cleaned = re.sub(
+        r"^(here is (a|the) summary[^\n]*\n?|sure[^\n]*\n?|certainly[^\n]*\n?)", 
+        "", 
+        raw_summary, 
+        flags=re.IGNORECASE
+    ).strip()
+    
+    return cleaned
+
+
 def generate_summary(transcript_text: str) -> str:
     """
     Generates a meeting summary using a local Llama model.
     Automatically downloads the GGUF model from Hugging Face if not found locally (same as Whisper).
+    For large transcripts, chunks and summarizes sections, then combines into final summary.
     """
     words = transcript_text.strip().split()
     if len(words) < 8:
@@ -343,13 +383,34 @@ def generate_summary(transcript_text: str) -> str:
         err_detail = f" ({_llama_import_error})" if _llama_import_error else ""
         return f"[Error: llama_cpp library not available{err_detail}. Install in venv: /opt/speech_env/bin/pip install llama-cpp-python]"
 
+    # Calculate dynamic context window based on transcript size
+    # Estimate: ~1.3 tokens per word (English text approximation)
+    transcript_tokens = int(len(words) * 1.3)
+    system_prompt_tokens = 450  # System prompt is ~350 words
+    response_buffer_tokens = 1024  # Space for model response
+    format_overhead = 50  # Template wrapper overhead
+    total_needed = transcript_tokens + system_prompt_tokens + response_buffer_tokens + format_overhead
+    
+    # Max safe context is 16384 for CPU processing
+    MAX_CONTEXT = 16384
+    needs_chunking = total_needed > MAX_CONTEXT
+    
+    # Round up to nearest power of 2 for efficient allocation, bounded 2048-16384
+    n_ctx = 2048
+    while n_ctx < total_needed and n_ctx < MAX_CONTEXT:
+        n_ctx *= 2
+    
+    print(f"[Llama] Transcript estimate: {transcript_tokens} tokens → Using n_ctx={n_ctx}")
+    if needs_chunking:
+        print(f"[Llama] Transcript exceeds {MAX_CONTEXT} tokens; will chunk and summarize sections.")
+
     model_path = os.environ.get("LLAMA_MODEL_PATH")
     hf_cache = os.environ.get("HF_HOME", "/var/bigbluebutton/hf_cache")
 
     try:
         if model_path and os.path.exists(model_path):
             print(f"[Llama] Loading model from path: {model_path}...")
-            llm = Llama(model_path=model_path, n_ctx=2048, n_threads=4, verbose=False)
+            llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=4, verbose=False)
         else:
             # Use hf_hub_download to get cached path without re-downloading every time
             repo_id = os.environ.get("LLAMA_REPO_ID", "TheBloke/Mistral-7B-Instruct-v0.1-GGUF")
@@ -364,7 +425,7 @@ def generate_summary(transcript_text: str) -> str:
                 local_dir_use_symlinks=False
             )
             print(f"[Llama] Loading from cache: {model_file}...")
-            llm = Llama(model_path=model_file, n_ctx=2048, n_threads=4, verbose=False)
+            llm = Llama(model_path=model_file, n_ctx=n_ctx, n_threads=4, verbose=False)
 
         system_prompt = (
             "You are an executive assistant analyzing speaker-attributed meeting transcripts.\n\n"
@@ -386,36 +447,56 @@ def generate_summary(transcript_text: str) -> str:
             "   - If truly no decisions or action items were stated, write 'None' under those specific headings."
         )
 
-        user_prompt = f"Summarize this meeting transcript:\n\n{transcript_text}"
-
-        # Format prompt using Llama 2 Chat template (different from Mistral)
-        formatted_prompt = (
-            f"[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_prompt} [/INST]"
-        )
-
-        print("[Llama] Generating summary...")
-        response = llm(
-            formatted_prompt,
-            max_tokens=1024,
-            temperature=0.7,
-            top_p=0.95,
-            stop=["[/INST]"]
-        )
-
-        raw_summary = response.get("choices", [{}])[0].get("text", "").strip()
+        # Handle chunking if transcript is too large
+        if needs_chunking:
+            print(f"[Llama] Splitting transcript into chunks for processing...")
+            
+            # Split transcript into roughly equal chunks by word count
+            # Target chunk size: ~10000 tokens = ~7700 words
+            chunk_size_words = 7700
+            transcript_words = transcript_text.split()
+            chunks = []
+            
+            for i in range(0, len(transcript_words), chunk_size_words):
+                chunk = " ".join(transcript_words[i:i+chunk_size_words])
+                chunks.append(chunk)
+            
+            print(f"[Llama] Processing {len(chunks)} chunks...")
+            chunk_summaries = []
+            
+            for idx, chunk in enumerate(chunks, 1):
+                print(f"[Llama] Summarizing chunk {idx}/{len(chunks)}...")
+                chunk_summary = _summarize_llama(llm, system_prompt, chunk, is_chunk=True)
+                if chunk_summary:
+                    chunk_summaries.append(chunk_summary)
+            
+            # Combine chunk summaries and create final summary
+            if not chunk_summaries:
+                return "[Error: Failed to generate chunk summaries]"
+            
+            combined_summaries = "\n\n---\n\n".join(chunk_summaries)
+            print(f"[Llama] Creating final summary from {len(chunks)} chunk summaries...")
+            
+            final_system_prompt = (
+                "You are an executive assistant synthesizing summaries from multiple sections of a single meeting.\n\n"
+                "GOAL: Combine these section summaries into one coherent, executive-level meeting summary.\n\n"
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. Do NOT include conversational intros or preambles. Start directly with '## Executive Summary'.\n"
+                "2. Eliminate redundancy while preserving all distinct topics, decisions, and action items.\n"
+                "3. EXECUTIVE SUMMARY: Provide 2-4 sentences covering the main themes.\n"
+                "4. KEY DISCUSSION POINTS: Consolidate key topics from all sections.\n"
+                "5. DECISIONS & ACTION ITEMS: List all explicit/implied decisions and action items across the meeting.\n"
+                "6. If no decisions or action items exist, write 'None' under those headings."
+            )
+            
+            final_summary = _summarize_llama(llm, final_system_prompt, combined_summaries, is_chunk=False)
+            return final_summary if final_summary else "[Error: Final summary synthesis failed]"
         
-        if not raw_summary:
-            return "[Error: Llama returned empty response]"
-
-        # Clean up any preamble
-        cleaned = re.sub(
-            r"^(here is (a|the) summary[^\n]*\n?|sure[^\n]*\n?|certainly[^\n]*\n?)", 
-            "", 
-            raw_summary, 
-            flags=re.IGNORECASE
-        ).strip()
-        
-        return cleaned
+        # Standard single-pass summarization for smaller transcripts
+        else:
+            print("[Llama] Generating summary (single pass)...")
+            summary = _summarize_llama(llm, system_prompt, transcript_text, is_chunk=False)
+            return summary if summary else "[Error: Llama returned empty response]"
 
     except Exception as e:
         return f"[Error generating summary with Llama: {e}]"
