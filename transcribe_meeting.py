@@ -327,6 +327,7 @@ def _summarize_llama(llm, system_prompt: str, transcript_text: str, is_chunk: bo
     """
     Internal helper: Summarize transcript using an already-loaded Llama model.
     is_chunk=True adjusts prompt for chunk summaries.
+    Raises RuntimeError if context window is exceeded (caller can handle retry).
     """
     if is_chunk:
         user_prompt = f"Summarize this section of a meeting transcript (this is one section of a longer meeting):\n\n{transcript_text}"
@@ -372,7 +373,7 @@ def generate_summary(transcript_text: str) -> str:
     if len(words) < 8:
         return (
             "## Executive Summary\n"
-            "No active meeting discussion recorded (empty transcript or automated prompt).\n\n"
+            "No meeting discussion recorded (empty transcript).\n\n"
             "## Key Discussion Points\nNone\n\n"
             "## Decisions Made\nNone\n\n"
             "## Action Items & Next Steps\nNone"
@@ -384,16 +385,18 @@ def generate_summary(transcript_text: str) -> str:
         return f"[Error: llama_cpp library not available{err_detail}. Install in venv: /opt/speech_env/bin/pip install llama-cpp-python]"
 
     # Calculate dynamic context window based on transcript size
-    # Estimate: ~1.3 tokens per word (English text approximation)
-    transcript_tokens = int(len(words) * 1.3)
-    system_prompt_tokens = 450  # System prompt is ~350 words
+    # Use 1.5 tokens per word (conservative for transcripts with speaker labels)
+    # Add 15% safety margin to account for tokenizer variations
+    transcript_tokens = int(len(words) * 1.5 * 1.15)
+    system_prompt_tokens = 600  # System prompt overhead (conservative)
     response_buffer_tokens = 1024  # Space for model response
-    format_overhead = 50  # Template wrapper overhead
+    format_overhead = 100  # Template wrapper + margins
     total_needed = transcript_tokens + system_prompt_tokens + response_buffer_tokens + format_overhead
     
-    # Max safe context is 16384 for CPU processing
+    # Max safe context is 16384, but leave 2000-token buffer for safety
     MAX_CONTEXT = 16384
-    needs_chunking = total_needed > MAX_CONTEXT
+    SAFE_USABLE_CONTEXT = 14000
+    needs_chunking = total_needed > SAFE_USABLE_CONTEXT
     
     # Round up to nearest power of 2 for efficient allocation, bounded 2048-16384
     n_ctx = 2048
@@ -402,7 +405,7 @@ def generate_summary(transcript_text: str) -> str:
     
     print(f"[Llama] Transcript estimate: {transcript_tokens} tokens → Using n_ctx={n_ctx}")
     if needs_chunking:
-        print(f"[Llama] Transcript exceeds {MAX_CONTEXT} tokens; will chunk and summarize sections.")
+        print(f"[Llama] Transcript exceeds safe limit of {SAFE_USABLE_CONTEXT} tokens; will chunk and summarize sections.")
 
     model_path = os.environ.get("LLAMA_MODEL_PATH")
     hf_cache = os.environ.get("HF_HOME", "/var/bigbluebutton/hf_cache")
@@ -451,9 +454,9 @@ def generate_summary(transcript_text: str) -> str:
         if needs_chunking:
             print(f"[Llama] Splitting transcript into chunks for processing...")
             
-            # Split transcript into roughly equal chunks by word count
-            # Target chunk size: ~10000 tokens = ~7700 words
-            chunk_size_words = 7700
+            # Conservative chunk size: ~6000 words (~10,350 tokens with 1.725 ratio + overhead)
+            # This stays safely under the 14000-token usable context window
+            chunk_size_words = 6000
             transcript_words = transcript_text.split()
             chunks = []
             
@@ -463,19 +466,64 @@ def generate_summary(transcript_text: str) -> str:
             
             print(f"[Llama] Processing {len(chunks)} chunks...")
             chunk_summaries = []
+            current_chunk_size = chunk_size_words
             
             for idx, chunk in enumerate(chunks, 1):
                 print(f"[Llama] Summarizing chunk {idx}/{len(chunks)}...")
-                chunk_summary = _summarize_llama(llm, system_prompt, chunk, is_chunk=True)
-                if chunk_summary:
-                    chunk_summaries.append(chunk_summary)
+                
+                # Retry mechanism: if chunk exceeds context, automatically reduce size and resplit
+                max_retries = 3
+                retry_count = 0
+                chunk_summary = None
+                
+                while retry_count < max_retries and chunk_summary is None:
+                    try:
+                        chunk_summary = _summarize_llama(llm, system_prompt, chunk, is_chunk=True)
+                        if chunk_summary:
+                            chunk_summaries.append(chunk_summary)
+                            break
+                    except Exception as e:
+                        error_msg = str(e)
+                        # Check if it's a context window error
+                        if "exceed" in error_msg.lower() and "context" in error_msg.lower():
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                # Reduce chunk size by 30% and re-chunk
+                                print(f"[Llama] ⚠️  Chunk {idx} exceeded context ({error_msg})")
+                                print(f"[Llama] Reducing chunk size from {current_chunk_size} to {int(current_chunk_size * 0.7)} words (retry {retry_count}/{max_retries})...")
+                                
+                                current_chunk_size = int(current_chunk_size * 0.7)
+                                
+                                # Re-split remaining chunks with smaller size
+                                chunk_words = chunk.split()
+                                smaller_chunks = []
+                                for j in range(0, len(chunk_words), current_chunk_size):
+                                    smaller_chunk = " ".join(chunk_words[j:j+current_chunk_size])
+                                    smaller_chunks.append(smaller_chunk)
+                                
+                                # Summarize smaller sub-chunks
+                                for sub_idx, smaller_chunk in enumerate(smaller_chunks, 1):
+                                    try:
+                                        sub_summary = _summarize_llama(llm, system_prompt, smaller_chunk, is_chunk=True)
+                                        if sub_summary:
+                                            chunk_summaries.append(sub_summary)
+                                    except Exception as sub_e:
+                                        print(f"[Llama] Error processing sub-chunk {sub_idx}: {sub_e}")
+                                
+                                chunk_summary = "retry_complete"  # Mark as handled
+                            else:
+                                print(f"[Llama] ❌ Chunk {idx} failed after {max_retries} retries: {error_msg}")
+                                chunk_summary = ""  # Skip this chunk on final failure
+                        else:
+                            # Non-context-window error, re-raise
+                            raise
             
             # Combine chunk summaries and create final summary
             if not chunk_summaries:
                 return "[Error: Failed to generate chunk summaries]"
             
             combined_summaries = "\n\n---\n\n".join(chunk_summaries)
-            print(f"[Llama] Creating final summary from {len(chunks)} chunk summaries...")
+            print(f"[Llama] Creating final summary from {len(chunk_summaries)} chunk summaries...")
             
             final_system_prompt = (
                 "You are an executive assistant synthesizing summaries from multiple sections of a single meeting.\n\n"
