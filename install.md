@@ -38,3 +38,8 @@ sudo chmod -R 775 /var/bigbluebutton/published/transcript
 # Execute from the ruby trigger (add this to /usr/local/bigbluebutton/core/scripts/post_publish/post_publish.rb)
 logger.info("Executing Whisper transcription for meeting: #{meeting_id}")  
 system("/usr/local/bigbluebutton/core/scripts/post_publish/01_transcribe_whisper.sh #{meeting_id}")
+
+# Customise the prompts
+transcribe_meeting.py: 495, system_prompt
+transcribe_meeting.py: 1286, final_system_prompt
+transcribe_meeting.py: 1160, initial_prompt

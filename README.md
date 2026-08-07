@@ -10,7 +10,7 @@ Artefacts are delivered directly via the default BBB presentation playback layer
 
 * **Local Speech-to-Text (`faster-whisper`)**: High-speed, int8-quantized `large-v3-turbo` model executing at ~0.4x real-time on Xeon Silver CPU.
 * **Speaker Attribution**: Cross-references BBB `events.xml` timestamps with audio segments automatically to identify speaker names in transcript logs.
-* **Local LLM Summaries**: Generates structured Markdown summaries using `llama-cpp-python` with a locally-hosted GGUF model (no external API calls).
+* **Local LLM Summaries**: Generates structured Markdown rolling context summaries using `llama-cpp-python` with a locally-hosted GGUF model (no external API calls).
 * **Native BBB Integration**: Registers custom formats (`summary` and `transcript`) directly into BBB metadata so front-ends like Greenlight automatically display valid playback links.
 * **Zero Nginx Configuration**: Files are hosted inside standard presentation folders, avoiding routing conflicts and custom web server hacks.
 

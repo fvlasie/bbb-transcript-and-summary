@@ -7,9 +7,8 @@ LOG_FILE="/var/log/bigbluebutton/post_publish_transcribe.log"
 # Localized cache directory for both Whisper and Llama models
 export HF_HOME="/var/bigbluebutton/hf_cache"
 
-# Llama 2 13B Chat (best quality for meeting context/nuance)
-export LLAMA_REPO_ID="TheBloke/Llama-2-13B-chat-GGUF"
-export LLAMA_FILENAME="llama-2-13b-chat.Q4_K_M.gguf"
+# Gemma 4 (best quality for meeting context/nuance)
+export LLM_MODEL_FAMILY="gemma-4"
 
 echo "[$(date)] Starting published WebM transcription for ${MEETING_ID}..." >> "$LOG_FILE"
 
