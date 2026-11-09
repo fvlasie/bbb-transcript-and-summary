@@ -1,0 +1,3 @@
+faster-whisper
+huggingface-hub
+llama-cpp-python

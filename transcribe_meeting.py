@@ -1,41 +1,58 @@
-#!/usr/local/bigbluebutton/core/scripts/post_publish/lib/transcribe_meeting.py
-import sys
+#!/usr/bin/env python3
+"""Transcribe a BigBlueButton recording and write a Markdown summary.
+
+Work-directory mode is what the off-host worker runs:
+
+    python3 transcribe_meeting.py --work-dir DIR --output-dir DIR
+
+The work directory must contain audio.opus (or webcams.webm / audio.webm) and
+may contain events.xml. The output directory receives transcript.txt,
+transcript.vtt, and summary.md.
+
+Passing a meeting id instead runs the legacy on-server path, which also
+renders HTML/RTF and registers BBB playback formats.
+"""
+
 import os
-import shutil
-import re
+import sys
+
+# Native libraries read these when they load. An explicit CPU_THREAD_LIMIT
+# from the worker wins. With no limit, keep the historical cap of 6 so an
+# accidental run on a BigBlueButton host does not take every core.
+_raw_thread_limit = os.environ.get("CPU_THREAD_LIMIT")
+if _raw_thread_limit:
+    try:
+        _THREAD_LIMIT = str(max(1, int(_raw_thread_limit)))
+    except ValueError:
+        _THREAD_LIMIT = "6"
+        os.environ["CPU_THREAD_LIMIT"] = _THREAD_LIMIT
+else:
+    _THREAD_LIMIT = "6"
+
+for _var in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_var, _THREAD_LIMIT)
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import json
+import re
 import warnings
-import datetime
 import xml.etree.ElementTree as ET
-import markdown
+
 from faster_whisper import WhisperModel
 from huggingface_hub import HfApi, hf_hub_download
 
-# HARD LIMIT underlying C++ thread pools BEFORE importing llama_cpp
-os.environ["OMP_NUM_THREADS"] = "6"
-os.environ["MKL_NUM_THREADS"] = "6"
-os.environ["OPENBLAS_NUM_THREADS"] = "6"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "6"
-os.environ["NUMEXPR_NUM_THREADS"] = "6"
-os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
-
-# Suppress harmless HuggingFace deprecation UserWarnings in logs
 warnings.filterwarnings("ignore", category=UserWarning)
 
 LLM_MODEL_FAMILY = os.environ.get("LLM_MODEL_FAMILY", "gemma-4").lower()
-
-# Keep CPU usage bounded so transcription and summarization do not monopolize the server.
-try:
-    available_cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-except Exception:
-    available_cpus = os.cpu_count() or 1
-
-# Cap default threads to 8 max for optimal llama.cpp SIMD execution
-DEFAULT_CPU_THREADS = min(6, max(1, available_cpus - 4))
-
-CPU_THREAD_LIMIT = int(os.environ.get("CPU_THREAD_LIMIT", str(DEFAULT_CPU_THREADS)))
-LLM_NUM_THREADS = int(os.environ.get("LLM_NUM_THREADS", str(min(6, CPU_THREAD_LIMIT))))
-WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", str(min(6, CPU_THREAD_LIMIT))))
+CPU_THREAD_LIMIT = max(1, int(os.environ.get("CPU_THREAD_LIMIT", _THREAD_LIMIT)))
+LLM_NUM_THREADS = max(1, int(os.environ.get("LLM_NUM_THREADS", str(CPU_THREAD_LIMIT))))
+WHISPER_CPU_THREADS = max(1, int(os.environ.get("WHISPER_CPU_THREADS", str(CPU_THREAD_LIMIT))))
 LLM_N_BATCH = int(os.environ.get("LLM_N_BATCH", "1024"))
 DEBUG_SUMMARY = os.environ.get("DEBUG_SUMMARY", "1").strip().lower() not in {"0", "false", "no", "off"}
 CHUNK_SIZE_WORDS = int(os.environ.get("CHUNK_SIZE_WORDS", "7000"))
@@ -127,276 +144,6 @@ try:
 except Exception as e:
     Llama = None
     _llama_import_error = str(e)
-
-
-def generate_rtf_from_md(md_text: str, rtf_path: str, meeting_name: str = "", meeting_date: str = ""):
-    """
-    Parses Markdown block and inline formatting (headings, bold, italics, lists) 
-    and converts it into a natively formatted RTF document with metadata headers.
-    """
-    def _escape_rtf(text: str) -> str:
-        """Escapes RTF special characters and converts non-ASCII characters to RTF unicode sequences."""
-        text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-        res = []
-        for char in text:
-            codepoint = ord(char)
-            if codepoint < 128:
-                res.append(char)
-            else:
-                res.append(f"\\u{codepoint}?")
-        return "".join(res)
-
-    def _md_inline_to_rtf(text: str) -> str:
-        """Converts inline Markdown (bold, italics, links) to native RTF formatting words."""
-        # Strip markdown links [label](url) -> label
-        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-        
-        # Split by bold (**text** / __text__) and italics (*text* / _text_)
-        parts = re.split(r"(\*\*.*?\*\*|\*.*?\*|__.*?__|_[^_]+_)", text)
-        rtf_parts = []
-        
-        for part in parts:
-            if (part.startswith("**") and part.endswith("**")) or (part.startswith("__") and part.endswith("__")):
-                inner = _escape_rtf(part[2:-2])
-                rtf_parts.append(f"\\b {inner}\\b0")
-            elif (part.startswith("*") and part.endswith("*")) or (part.startswith("_") and part.endswith("_")):
-                inner = _escape_rtf(part[1:-1])
-                rtf_parts.append(f"\\i {inner}\\i0")
-            else:
-                rtf_parts.append(_escape_rtf(part))
-                
-        return "".join(rtf_parts)
-
-    # RTF Header structure, font table, and color table
-    rtf_lines = [
-        "{\\rtf1\\ansi\\deff0",
-        "{\\fonttbl{\\f0\\froman\\fcharset0 Gentium Book Plus;}{\\f1\\fnil\\fcharset0 Helvetica;}}",
-        "{\\colortbl ;\\red43\\green108\\blue176;\\red113\\green128\\blue150;\\red26\\green32\\blue44;}",
-        "\\viewkind4\\uc1\\paperw12240\\paperh15840\\margl1440\\margr1440\\margt1440\\margb1440",
-        "\\f0\\fs24\\cf3"  # Default font size 12pt (fs24)
-    ]
-
-    # Add Document Title / Meeting Metadata Header
-    if meeting_name:
-        clean_name = _escape_rtf(meeting_name)
-        rtf_lines.append(f"\\f1\\b\\fs36\\cf1 {clean_name}\\b0\\par")
-    if meeting_date:
-        clean_date = _escape_rtf(meeting_date)
-        rtf_lines.append(f"\\f1\\fs20\\cf2 Date: {clean_date}\\fs24\\cf3\\par\\par")
-    if meeting_name or meeting_date:
-        rtf_lines.append("\\f0")  # Switch back to main body font
-
-    # Parse Markdown blocks line-by-line
-    for line in md_text.splitlines():
-        clean_line = line.strip()
-
-        if not clean_line:
-            rtf_lines.append("\\par")
-            continue
-
-        # ## Heading 2
-        if clean_line.startswith("## "):
-            header_text = _md_inline_to_rtf(clean_line[3:])
-            rtf_lines.append(f"\\sb200\\sa100\\b\\fs30\\cf1 {header_text}\\b0\\fs24\\cf3\\par")
-        # ### Heading 3
-        elif clean_line.startswith("### "):
-            header_text = _md_inline_to_rtf(clean_line[4:])
-            rtf_lines.append(f"\\sb150\\sa80\\b\\fs26\\cf1 {header_text}\\b0\\fs24\\cf3\\par")
-        # Bullet Points (- item or * item)
-        elif clean_line.startswith("- ") or clean_line.startswith("* "):
-            item_text = _md_inline_to_rtf(clean_line[2:])
-            rtf_lines.append(f"\\fi-360\\li720 \\bullet\\tab {item_text}\\par")
-        # Regular Paragraph
-        else:
-            para_text = _md_inline_to_rtf(clean_line)
-            rtf_lines.append(f"\\sa120 {para_text}\\par")
-
-    rtf_lines.append("}")
-
-    # Write generated RTF string to target file
-    with open(rtf_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(rtf_lines))
-
-    print(f"[RTF] Successfully generated formatted RTF document at: {rtf_path}")
-
-
-def generate_html_viewer(md_text: str, html_path: str, rtf_filename: str, meeting_name: str = "", meeting_date: str = ""):
-    """
-    Renders Markdown summary into a stylized HTML paper document with meeting metadata and downloadable RTF.
-    """
-    html_body = []
-    
-    if meeting_name or meeting_date:
-        html_body.append("<div style='margin-bottom: 25px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;'>")
-        if meeting_name:
-            html_body.append(f"<h1 style='font-size: 28px; margin: 0 0 5px 0;'>{meeting_name}</h1>")
-        if meeting_date:
-            html_body.append(f"<p style='color: #718096; font-size: 16px; margin: 0;'><strong>Date:</strong> {meeting_date}</p>")
-        html_body.append("</div>")
-
-    in_list = False
-
-    for line in md_text.splitlines():
-        clean_line = line.strip()
-        
-        if clean_line.startswith("- ") or clean_line.startswith("* "):
-            if not in_list:
-                html_body.append("<ul>")
-                in_list = True
-            item_text = clean_line[2:]
-            item_text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", item_text)
-            html_body.append(f"  <li>{item_text}</li>")
-            continue
-        else:
-            if in_list:
-                html_body.append("</ul>")
-                in_list = False
-
-        if clean_line.startswith("## "):
-            html_body.append(f"<h2>{clean_line[3:]}</h2>")
-        elif clean_line.startswith("### "):
-            html_body.append(f"<h3>{clean_line[4:]}</h3>")
-        elif clean_line == "":
-            continue
-        else:
-            text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", clean_line)
-            html_body.append(f"<p>{text}</p>")
-
-    if in_list:
-        html_body.append("</ul>")
-
-    body_content = "\n".join(html_body)
-
-    html_template = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Meeting Summary - {meeting_name or "BBB Session"}</title>
-    <style>
-        @import url('https://fonts.bunny.net/css?family=gentium-book-plus:400,400i,700,700i');
-
-        * {{ box-sizing: border-box; }}
-
-        body {{
-            background-color: #6f7c8d;
-            color: #2d3748;
-            font-family: 'Gentium Book Plus', Georgia, serif;
-            font-size: 19px;
-            line-height: 1.6;
-            margin: 0;
-            padding: 40px 20px;
-            display: flex;
-            justify-content: center;
-        }}
-
-        .paper-container {{
-            background: #ffffff;
-            width: 100%;
-            max-width: 820px;
-            padding: 60px 70px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05), 0 1px 3px rgba(0, 0, 0, 0.03);
-            position: relative;
-        }}
-
-        .toolbar {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 2px solid #edf2f7;
-            padding-bottom: 20px;
-            margin-bottom: 35px;
-        }}
-
-        .meeting-title {{
-            font-size: 14px;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #718096;
-            font-weight: 700;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }}
-
-        .btn-download {{
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            background-color: #2b6cb0;
-            color: #ffffff;
-            text-decoration: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-size: 14px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            font-weight: 600;
-            transition: background-color 0.2s ease;
-        }}
-
-        .btn-download:hover {{ background-color: #2c5282; }}
-
-        h2 {{
-            font-size: 26px;
-            color: #1a202c;
-            margin-top: 35px;
-            margin-bottom: 15px;
-            border-bottom: 1px solid #e2e8f0;
-            padding-bottom: 6px;
-        }}
-
-        h3 {{ font-size: 21px; color: #2d3748; margin-top: 25px; margin-bottom: 10px; }}
-        p {{ margin-bottom: 18px; }}
-        ul {{ margin-top: 5px; margin-bottom: 20px; padding-left: 25px; }}
-        li {{ margin-bottom: 8px; }}
-        strong {{ color: #1a202c; }}
-    </style>
-</head>
-<body>
-    <div class="paper-container">
-        <div class="toolbar">
-            <span class="meeting-title">Meeting Summary</span>
-            <a href="{rtf_filename}" download class="btn-download">
-                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
-                    <path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
-                    <path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/>
-                </svg>
-                Download RTF
-            </a>
-        </div>
-        <div class="content">
-            {body_content}
-        </div>
-    </div>
-</body>
-</html>
-"""
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_template)
-
-
-def get_meeting_metadata(pres_dir: str) -> tuple[str, str]:
-    """Reads BBB presentation metadata.xml to extract Room Name and Meeting Date."""
-    pres_meta_path = os.path.join(pres_dir, "metadata.xml")
-    room_name = "Meeting Session"
-    meeting_date = datetime.date.today().strftime("%Y-%m-%d")
-
-    if os.path.exists(pres_meta_path) and os.path.getsize(pres_meta_path) > 0:
-        try:
-            tree = ET.parse(pres_meta_path)
-            root = tree.getroot()
-            meeting_name_node = root.find(".//meetingName") or root.find(".//meta/meetingName")
-            if meeting_name_node is not None and meeting_name_node.text:
-                room_name = meeting_name_node.text.strip()
-
-            start_time_node = root.find("start_time")
-            if start_time_node is not None and start_time_node.text:
-                ms = float(start_time_node.text.strip())
-                dt = datetime.datetime.fromtimestamp(ms / 1000.0)
-                meeting_date = dt.strftime("%Y-%m-%d")
-        except Exception as e:
-            print(f"[Metadata Warning] Could not parse metadata details: {e}")
-
-    return room_name, meeting_date
 
 
 def parse_bbb_speaker_timeline(events_xml_path: str):
@@ -1095,7 +842,7 @@ def generate_summary(transcript_text: str) -> str:
 
     if Llama is None:
         err_detail = f" ({_llama_import_error})" if _llama_import_error else ""
-        return f"[Error: llama_cpp library not available{err_detail}. Install in venv: /opt/speech_env/bin/pip install llama-cpp-python]"
+        return f"[Error: llama_cpp library not available{err_detail}. Install in the worker venv: /opt/transcript-worker/venv/bin/pip install llama-cpp-python]"
 
     transcript_tokens = int(len(words) * 1.5 * 1.25)
     system_prompt_tokens = 800
@@ -1306,164 +1053,148 @@ def generate_summary(transcript_text: str) -> str:
         return f"[Error generating summary with Gemma: {e}]"
 
 
-def register_custom_formats_native(
-    meeting_id: str,
-    base_published_dir: str = "/var/bigbluebutton/published"
-):
-    """
-    Creates native published format directories for 'summary' and 'transcript'
-    by reading (and NOT modifying) the primary presentation metadata.xml.
-    """
-    domain = get_server_domain()
-    if not domain.startswith("http://") and not domain.startswith("https://"):
-        domain = f"https://{domain}"
+AUDIO_NAMES = ("audio.opus", "webcams.webm", "audio.webm")
+
+
+def find_audio_file(directory: str) -> str:
+    """Return the first non-empty audio file the worker or a legacy run can use."""
+    for name in AUDIO_NAMES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    raise FileNotFoundError(
+        "No audio file found. Expected audio.opus, webcams.webm, or audio.webm."
+    )
+
+
+def write_transcript(audio_path: str, events_xml_path: str | None, transcript_dir: str) -> str:
+    """Transcribe audio and write transcript.txt plus transcript.vtt."""
+    os.makedirs(transcript_dir, exist_ok=True)
+    timeline = []
+    if events_xml_path and os.path.exists(events_xml_path):
+        timeline = parse_bbb_speaker_timeline(events_xml_path)
+
+    download_root = os.environ.get("HF_HOME", "/var/bigbluebutton/hf_cache")
+    os.makedirs(download_root, exist_ok=True)
+
+    print("[Whisper] Loading model 'large-v3-turbo'...")
+    model = WhisperModel(
+        "large-v3-turbo",
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=WHISPER_CPU_THREADS,
+        download_root=download_root,
+    )
+
+    print(f"[Whisper] Transcribing: {audio_path}...")
+    segments, _ = model.transcribe(
+        audio_path,
+        vad_filter=True,
+        language="en",
+        initial_prompt=(
+            "Orthodox Christian seminary academic lecture, class, or faculty meeting. "
+            "Discussion covers theological studies, coursework, liturgy, faculty, "
+            "and administrative policies."
+        ),
+    )
+
+    full_transcript = []
+    vtt_lines = ["WEBVTT\n"]
+    current_speaker = None
+
+    for segment in segments:
+        raw_text = segment.text.strip()
+
+        if "you are currently the only person" in raw_text.lower():
+            continue
+
+        speaker = get_speaker_for_timestamp(segment.start, segment.end, timeline)
+
+        hrs = int(segment.start // 3600)
+        mins = int((segment.start % 3600) // 60)
+        secs = int(segment.start % 60)
+        time_str = f"[{hrs:02d}:{mins:02d}:{secs:02d}]" if hrs > 0 else f"[{mins:02d}:{secs:02d}]"
+
+        if speaker and speaker != current_speaker:
+            if full_transcript:
+                full_transcript.append("")
+            full_transcript.append(f"[{speaker}]")
+            current_speaker = speaker
+
+        full_transcript.append(f"{time_str}: {raw_text}")
+
+        vtt_prefix = f"[{speaker}]: " if speaker else ""
+        vtt_text = f"{vtt_prefix}{raw_text}"
+
+        start_fmt = f"{int(segment.start//3600):02d}:{int((segment.start%3600)//60):02d}:{segment.start%60:06.3f}"
+        end_fmt = f"{int(segment.end//3600):02d}:{int((segment.end%3600)//60):02d}:{segment.end%60:06.3f}"
+
+        vtt_lines.append(f"{start_fmt} --> {end_fmt}\n{vtt_text}\n")
+
+    full_text = "\n".join(full_transcript)
+    txt_path = os.path.join(transcript_dir, "transcript.txt")
+    vtt_path = os.path.join(transcript_dir, "transcript.vtt")
+
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write(full_text + "\n")
+    with open(vtt_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(vtt_lines) + "\n")
+
+    return full_text
+
+
+def write_summary_file(transcript_text: str, summary_path: str) -> str:
+    """Write summary.md and return the summary text."""
+    print("[Summary] Generating AI meeting summary...")
+    summary = generate_summary(transcript_text)
+    parent = os.path.dirname(os.path.abspath(summary_path))
+    os.makedirs(parent, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        handle.write(summary + "\n")
+    return summary
+
+
+def run_work_dir(work_dir: str, output_dir: str) -> None:
+    """Worker entry: read a job directory and write the three result files."""
+    audio_path = find_audio_file(work_dir)
+    events_xml_path = os.path.join(work_dir, "events.xml")
+    os.makedirs(output_dir, exist_ok=True)
+    full_text = write_transcript(
+        audio_path,
+        events_xml_path if os.path.exists(events_xml_path) else None,
+        output_dir,
+    )
+    summary_path = os.path.join(output_dir, "summary.md")
+    summary = write_summary_file(full_text, summary_path)
+    if summary.startswith("[Error"):
+        print(f"[Pipeline] Summary failed: {summary}")
+        sys.exit(1)
+    print(f"[Pipeline] Wrote transcript and summary to {output_dir}")
+
+
+def run_bbb_local(meeting_id: str, summary_only: bool, transcript_only: bool, transcript_input_path: str | None) -> None:
+    """Legacy path that reads and writes the BigBlueButton published directories."""
+    from bbb_publish import (
+        generate_html_viewer,
+        generate_rtf_from_md,
+        get_meeting_metadata,
+        own_published,
+        register_custom_formats_native,
+        summary_rtf_filename,
+    )
+
+    base_published_dir = os.environ.get("BBB_PUBLISHED_DIR", "/var/bigbluebutton/published")
+    raw_root = os.environ.get("BBB_RAW_DIR", "/var/bigbluebutton/recording/raw")
 
     pres_dir = os.path.join(base_published_dir, "presentation", meeting_id)
-    pres_meta_path = os.path.join(pres_dir, "metadata.xml")
-
-    if not os.path.exists(pres_meta_path):
-        print(f"[Metadata Error] Primary metadata file not found at {pres_meta_path}")
-        return
-
-    if os.path.getsize(pres_meta_path) == 0:
-        print(f"[Metadata Error] Primary metadata file at {pres_meta_path} is empty.")
-        return
-
-    try:
-        tree = ET.parse(pres_meta_path)
-        root = tree.getroot()
-
-        meeting_elem = root.find("meeting")
-        meta_elem = root.find("meta")
-        start_time = root.findtext("start_time", default="")
-        end_time = root.findtext("end_time", default="")
-        participants = root.findtext("participants", default="0")
-        
-        playback = root.find("playback")
-        duration = playback.findtext("duration", default="0") if playback is not None else "0"
-
-        formats = {
-            "summary": f"{domain}/presentation/{meeting_id}/summary/summary.html",
-            "transcript": f"{domain}/presentation/{meeting_id}/transcript/transcript.txt"
-        }
-
-        for fmt_name, fmt_link in formats.items():
-            fmt_dir = os.path.join(base_published_dir, fmt_name, meeting_id)
-            os.makedirs(fmt_dir, exist_ok=True)
-
-            new_root = ET.Element("recording")
-            ET.SubElement(new_root, "id").text = meeting_id
-            ET.SubElement(new_root, "state").text = "published"
-            ET.SubElement(new_root, "published").text = "true"
-            if start_time: ET.SubElement(new_root, "start_time").text = start_time
-            if end_time: ET.SubElement(new_root, "end_time").text = end_time
-            ET.SubElement(new_root, "participants").text = participants
-
-            if meeting_elem is not None:
-                new_root.append(meeting_elem)
-
-            if meta_elem is not None:
-                new_root.append(meta_elem)
-
-            new_playback = ET.SubElement(new_root, "playback")
-            ET.SubElement(new_playback, "format").text = fmt_name
-            ET.SubElement(new_playback, "link").text = fmt_link
-            ET.SubElement(new_playback, "processing_time").text = "0"
-            ET.SubElement(new_playback, "duration").text = duration
-            ET.SubElement(new_playback, "size").text = "0"
-
-            meta_file_path = os.path.join(fmt_dir, "metadata.xml")
-            new_tree = ET.ElementTree(new_root)
-            
-            temp_meta_path = meta_file_path + ".tmp"
-            ET.indent(new_tree, space="  ")
-            new_tree.write(temp_meta_path, encoding="UTF-8", xml_declaration=True)
-            shutil.move(temp_meta_path, meta_file_path)
-
-            shutil.chown(fmt_dir, user="bigbluebutton", group="bigbluebutton")
-            shutil.chown(meta_file_path, user="bigbluebutton", group="bigbluebutton")
-            os.chmod(fmt_dir, 0o755)
-            os.chmod(meta_file_path, 0o644)
-
-            print(f"[Success] Created native format for '{fmt_name}' at {meta_file_path}")
-
-    except ET.ParseError as pe:
-        print(f"[Metadata Error] Malformed XML encountered in primary metadata: {pe}")
-    except Exception as e:
-        print(f"[Metadata Error] Failed to process {meeting_id}: {e}")
-
-def get_server_domain() -> str:
-    """
-    Reads the BigBlueButton server URL directly from bbb-web.properties.
-    Raises RuntimeError if the file or key is missing.
-    """
-    prop_path = "/etc/bigbluebutton/bbb-web.properties"
-    
-    if os.path.exists(prop_path):
-        try:
-            with open(prop_path, "r") as f:
-                for line in f:
-                    if line.strip().startswith("bigbluebutton.web.serverURL="):
-                        url = line.split("=", 1)[1].strip()
-                        if url:
-                            return url.rstrip("/")
-        except Exception as e:
-            raise RuntimeError(f"Failed to read {prop_path}: {e}")
-
-    raise RuntimeError(f"Could not resolve server URL. Key 'bigbluebutton.web.serverURL' missing or file not found at {prop_path}")
-
-def main():
-    argv = sys.argv[1:]
-    if not argv:
-        print("Usage: python3 transcribe_meeting.py <meeting_id> [--summary-only] [--transcript-only] [--transcript-file PATH]")
-        sys.exit(1)
-
-    meeting_id = None
-    summary_only = False
-    transcript_only = False
-    transcript_input_path = None
-
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--summary-only":
-            summary_only = True
-        elif arg == "--transcript-only":
-            transcript_only = True
-        elif arg == "--transcript-file":
-            if i + 1 >= len(argv):
-                print("[Error] --transcript-file requires a file path argument.")
-                sys.exit(1)
-            transcript_input_path = argv[i + 1]
-            i += 1
-        elif arg.startswith("--"):
-            print(f"[Error] Unknown argument: {arg}")
-            sys.exit(1)
-        elif meeting_id is None:
-            meeting_id = arg
-        else:
-            print(f"[Error] Unexpected positional argument: {arg}")
-            sys.exit(1)
-        i += 1
-
-    if not meeting_id:
-        print("Usage: python3 transcribe_meeting.py <meeting_id> [--summary-only] [--transcript-only] [--transcript-file PATH]")
-        sys.exit(1)
-
-    base_published_dir = "/var/bigbluebutton/published"
-    
-    pres_dir = os.path.join(base_published_dir, "presentation", meeting_id)
-    events_xml_path = f"/var/bigbluebutton/recording/raw/{meeting_id}/events.xml"
-    
+    events_xml_path = os.path.join(raw_root, meeting_id, "events.xml")
     transcript_dir = os.path.join(pres_dir, "transcript")
     summary_dir = os.path.join(pres_dir, "summary")
-    
+
     os.makedirs(transcript_dir, exist_ok=True)
     os.makedirs(summary_dir, exist_ok=True)
 
     print(f"--- Processing AI Pipeline for Recording: {meeting_id} ---")
-
-    full_text = ""
 
     if summary_only:
         print("[Summary] Summary-only mode enabled; skipping audio transcription.")
@@ -1485,124 +1216,114 @@ def main():
                 sys.exit(1)
     else:
         webm_path = os.path.join(pres_dir, "video", "webcams.webm")
-        if not os.path.exists(webm_path):
+        if not os.path.isfile(webm_path):
             fallback_audio = os.path.join(pres_dir, "audio", "audio.webm")
-            if os.path.exists(fallback_audio):
+            if os.path.isfile(fallback_audio):
                 webm_path = fallback_audio
             else:
                 print(f"[Error] No audio/video WebM file found for meeting {meeting_id} under {pres_dir}")
                 sys.exit(1)
 
-        timeline = parse_bbb_speaker_timeline(events_xml_path) if os.path.exists(events_xml_path) else []
-
-        print(f"[Whisper] Loading model 'large-v3-turbo'...")
-        model = WhisperModel(
-            "large-v3-turbo",
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=WHISPER_CPU_THREADS,
-            download_root="/var/bigbluebutton/hf_cache",
+        full_text = write_transcript(
+            webm_path,
+            events_xml_path if os.path.exists(events_xml_path) else None,
+            transcript_dir,
         )
-
-        print(f"[Whisper] Transcribing WebM: {webm_path}...")
-        segments, _ = model.transcribe(
-            webm_path, 
-            vad_filter=True, 
-            language="en",
-            initial_prompt=(
-                "Orthodox Christian seminary academic lecture, class, or faculty meeting. "
-                "Discussion covers theological studies, coursework, liturgy, faculty, "
-                "and administrative policies."
-            )
-        )
-
-        full_transcript = []
-        vtt_lines = ["WEBVTT\n"]
-        current_speaker = None
-
-        for segment in segments:
-            raw_text = segment.text.strip()
-
-            if "you are currently the only person" in raw_text.lower():
-                continue
-
-            speaker = get_speaker_for_timestamp(segment.start, segment.end, timeline)
-
-            hrs = int(segment.start // 3600)
-            mins = int((segment.start % 3600) // 60)
-            secs = int(segment.start % 60)
-            time_str = f"[{hrs:02d}:{mins:02d}:{secs:02d}]" if hrs > 0 else f"[{mins:02d}:{secs:02d}]"
-
-            if speaker and speaker != current_speaker:
-                if full_transcript:
-                    full_transcript.append("")
-                full_transcript.append(f"[{speaker}]")
-                current_speaker = speaker
-
-            full_transcript.append(f"{time_str}: {raw_text}")
-
-            vtt_prefix = f"[{speaker}]: " if speaker else ""
-            vtt_text = f"{vtt_prefix}{raw_text}"
-
-            start_fmt = f"{int(segment.start//3600):02d}:{int((segment.start%3600)//60):02d}:{segment.start%60:06.3f}"
-            end_fmt = f"{int(segment.end//3600):02d}:{int((segment.end%3600)//60):02d}:{segment.end%60:06.3f}"
-
-            vtt_lines.append(f"{start_fmt} --> {end_fmt}\n{vtt_text}\n")
-
-        full_text = "\n".join(full_transcript)
-
-        txt_path = os.path.join(transcript_dir, "transcript.txt")
-        vtt_path = os.path.join(transcript_dir, "transcript.vtt")
-
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(full_text + "\n")
-
-        with open(vtt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(vtt_lines) + "\n")
-
-        for path in [transcript_dir, txt_path, vtt_path]:
-            shutil.chown(path, user="bigbluebutton", group="bigbluebutton")
-            os.chmod(path, 0o755 if os.path.isdir(path) else 0o644)
+        for path in (
+            transcript_dir,
+            os.path.join(transcript_dir, "transcript.txt"),
+            os.path.join(transcript_dir, "transcript.vtt"),
+        ):
+            own_published(path)
 
     if transcript_only:
         print("[Pipeline] Transcript-only mode enabled; skipping summary generation.")
         return
 
-    # 5. Extract metadata & generate summary artifacts
-    print("[Summary] Generating AI meeting summary...")
-    summary = generate_summary(full_text)
-
-    room_name, meeting_date = get_meeting_metadata(pres_dir)
-
-    # Sanitize room name for filesystem safety in filename
-    safe_room_name = re.sub(r'[\\/*?:"<>|]', "", room_name).replace(" ", "_")
-    rtf_filename = f"Summary_{safe_room_name}_{meeting_date}.rtf"
-
     summary_md_path = os.path.join(summary_dir, "summary.md")
+    summary = write_summary_file(full_text, summary_md_path)
+    room_name, meeting_date = get_meeting_metadata(pres_dir)
+    rtf_filename = summary_rtf_filename(room_name, meeting_date)
     summary_html_path = os.path.join(summary_dir, "summary.html")
     summary_rtf_path = os.path.join(summary_dir, rtf_filename)
 
-    # Write Markdown
-    with open(summary_md_path, "w", encoding="utf-8") as f:
-        f.write(summary + "\n")
-
-    # Generate HTML & RTF with room metadata
     generate_rtf_from_md(summary, summary_rtf_path, meeting_name=room_name, meeting_date=meeting_date)
     generate_html_viewer(summary, summary_html_path, rtf_filename=rtf_filename, meeting_name=room_name, meeting_date=meeting_date)
 
-    # Apply permissions across all summary artifacts
-    for path in [summary_dir, summary_md_path, summary_html_path, summary_rtf_path]:
+    for path in (summary_dir, summary_md_path, summary_html_path, summary_rtf_path):
         if os.path.exists(path):
-            shutil.chown(path, user="bigbluebutton", group="bigbluebutton")
-            os.chmod(path, 0o755 if os.path.isdir(path) else 0o644)
+            own_published(path)
 
     print("[Pipeline] Registering native format directories...")
     register_custom_formats_native(
         meeting_id=meeting_id,
-        base_published_dir=base_published_dir
+        base_published_dir=base_published_dir,
+    )
+    print(f"[Pipeline] Finished processing {meeting_id} successfully.")
+
+
+def main():
+    argv = sys.argv[1:]
+    usage = (
+        "Usage: python3 transcribe_meeting.py <meeting_id> [--summary-only] [--transcript-only] [--transcript-file PATH]\n"
+        "       python3 transcribe_meeting.py --work-dir DIR --output-dir DIR"
     )
 
-    print(f"[Pipeline] Finished processing {meeting_id} successfully.")
+    meeting_id = None
+    summary_only = False
+    transcript_only = False
+    transcript_input_path = None
+    work_dir = None
+    output_dir = None
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--summary-only":
+            summary_only = True
+        elif arg == "--transcript-only":
+            transcript_only = True
+        elif arg in ("--transcript-file", "--work-dir", "--output-dir"):
+            if i + 1 >= len(argv):
+                print(f"[Error] {arg} requires a path argument.")
+                sys.exit(2)
+            value = argv[i + 1]
+            i += 1
+            if arg == "--transcript-file":
+                transcript_input_path = value
+            elif arg == "--work-dir":
+                work_dir = value
+            else:
+                output_dir = value
+        elif arg.startswith("--"):
+            print(f"[Error] Unknown argument: {arg}")
+            print(usage)
+            sys.exit(2)
+        elif meeting_id is None:
+            meeting_id = arg
+        else:
+            print(f"[Error] Unexpected positional argument: {arg}")
+            print(usage)
+            sys.exit(2)
+        i += 1
+
+    if work_dir or output_dir:
+        if not work_dir or not output_dir:
+            print("[Error] Both --work-dir and --output-dir are required.")
+            print(usage)
+            sys.exit(2)
+        if meeting_id or summary_only or transcript_only or transcript_input_path:
+            print("[Error] Work-directory mode does not take a meeting id or the legacy flags.")
+            print(usage)
+            sys.exit(2)
+        run_work_dir(work_dir, output_dir)
+        return
+
+    if not meeting_id:
+        print(usage)
+        sys.exit(2)
+
+    run_bbb_local(meeting_id, summary_only, transcript_only, transcript_input_path)
 
 
 if __name__ == "__main__":

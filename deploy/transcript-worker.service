@@ -1,0 +1,23 @@
+[Unit]
+Description=BigBlueButton transcript worker
+After=network-online.target
+
+[Service]
+Type=simple
+User=transcript
+Group=transcript
+EnvironmentFile=/etc/transcript-worker.env
+ExecStart=/opt/transcript-worker/venv/bin/python /opt/transcript-worker/worker_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/transcript-worker
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target
