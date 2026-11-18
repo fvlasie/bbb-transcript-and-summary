@@ -2,6 +2,7 @@
 """Pull finished transcripts back onto the BigBlueButton host and publish them."""
 
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +23,11 @@ from worker_client import RESULT_TAR_NAMES, WorkerClient, WorkerError, safe_extr
 
 class RetryableError(Exception):
     """The published recording is not ready to receive files yet."""
+
+
+RECORDING_READY_CALLBACK = Path(
+    "/usr/local/bigbluebutton/core/scripts/post_publish/post_publish_recording_ready_callback.rb"
+)
 
 
 def publish_artifacts(config: BBBConfig, meeting_id: str, result_dir: Path) -> None:
@@ -129,6 +135,43 @@ def _pull_and_publish(config: BBBConfig, job: dict, client: WorkerClient) -> Non
         log_line(config, f"Retrieve failed for {meeting_id}: {exc}")
         return
     _mark_retrieved(config, job)
+    notify_recording_ready(config, meeting_id)
+
+
+def notify_recording_ready(config: BBBConfig, meeting_id: str, script_path: Path = RECORDING_READY_CALLBACK) -> None:
+    """Tell Greenlight to fetch the recording again now that both formats exist.
+
+    The stock callback runs at presentation publish, which is before this worker
+    has finished. Greenlight stores whatever formats exist at that moment.
+    """
+    if not script_path.is_file():
+        log_line(config, f"Recording-ready callback is missing; Greenlight was not notified for {meeting_id}")
+        return
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/bundle",
+                "exec",
+                "ruby",
+                str(script_path),
+                "-m",
+                meeting_id,
+                "-f",
+                "presentation",
+            ],
+            cwd=str(script_path.parent.parent),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_line(config, f"Could not notify Greenlight for {meeting_id}: {exc}")
+        return
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "callback failed").strip()
+        log_line(config, f"Recording-ready callback failed for {meeting_id}: {detail[-300:]}")
+        return
+    log_line(config, f"Notified Greenlight that {meeting_id} formats are ready")
 
 
 def _retry_or_give_up(config: BBBConfig, job: dict, remote_error: str | None, client: WorkerClient, submit) -> None:
