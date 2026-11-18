@@ -1,3 +1,5 @@
 faster-whisper
+# faster-whisper 1.2.1 passes metadata_errors to av.open(). PyAV 19 removed that argument.
+av>=16,<19
 huggingface-hub
 llama-cpp-python

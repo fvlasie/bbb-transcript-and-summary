@@ -117,7 +117,7 @@ def _infer_group_source_label_counts(llm, transcript_text: str) -> dict[str, boo
         max_tokens=512,
         temperature=0.0,
         top_p=0.9,
-        stop=["<end_of_turn>"],
+        stop=_completion_stop(),
     )
 
     raw_text = response.get("choices", [{}])[0].get("text", "").strip()
@@ -233,10 +233,27 @@ def get_speaker_for_timestamp(start_sec: float, end_sec: float, timeline: list) 
     return ""
 
 
+def _completion_stop(model_family: str | None = None) -> list[str]:
+    """Stop tokens for the configured model family."""
+    family = (model_family or LLM_MODEL_FAMILY or "gemma-4").lower()
+    if family == "gemma-4":
+        return ["<turn|>"]
+    return ["<end_of_turn>"]
+
+
 def _build_chat_prompt(system_prompt: str, user_prompt: str, model_family: str | None = None) -> str:
     """Build a model-specific chat prompt for the configured model family."""
     family = (model_family or LLM_MODEL_FAMILY or "gemma-4").lower()
-    if family in {"gemma", "gemma-4"}:
+    if family == "gemma-4":
+        # Gemma 4 uses <|turn> ... <turn|>. The Gemma 3 markers are not in its vocabulary.
+        return (
+            "<|turn>system\n"
+            f"{system_prompt}<turn|>\n"
+            "<|turn>user\n"
+            f"{user_prompt}<turn|>\n"
+            "<|turn>model\n"
+        )
+    if family == "gemma":
         return (
             "<start_of_turn>system\n"
             f"{system_prompt}\n"
@@ -560,7 +577,7 @@ def summarize_chunk_to_state_delta(
         max_tokens=CHUNK_JSON_MAX_TOKENS,
         temperature=0.1,
         top_p=0.9,
-        stop=["<end_of_turn>"],
+        stop=_completion_stop(),
     )
 
     choice = response.get("choices", [{}])[0]
@@ -725,7 +742,7 @@ def prioritize_meeting_state(llm, full_meeting_state: dict, max_items_per_catego
         max_tokens=1800,
         temperature=0.1,
         top_p=0.9,
-        stop=["<end_of_turn>"],
+        stop=_completion_stop(),
     )
 
     raw_text = response.get("choices", [{}])[0].get("text", "").strip()
@@ -781,7 +798,7 @@ def synthesize_final_summary(llm, system_prompt: str, meeting_state: dict) -> st
         max_tokens=1400,
         temperature=0.3,
         top_p=0.9,
-        stop=["<end_of_turn>"],
+        stop=_completion_stop(),
     )
 
     raw_summary = response.get("choices", [{}])[0].get("text", "").strip()
